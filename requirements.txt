@@ -1,0 +1,6 @@
+curl-cffi>=0.6
+requests[socks]>=2.31
+fastapi
+uvicorn
+playwright>=1.40
+tzdata>=2025.2; platform_system == "Windows"

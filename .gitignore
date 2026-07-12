@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local workflow state and private engineering artifacts
+.omx/
+.superpowers/
+artifacts/
+docs/
+PROTOCOL.md
+vendor/
+
+# Runtime data, encrypted backups, and explicit credential exports
+backups/
+output/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.twbackup
+*.har
+*.cpa.json
+*.session.json
+*.pat.json
+workflow*.json
+
+# Mailbox/account source files
+hotmail*.txt
+*hotmail*.txt
+accounts*.txt
+mail_accounts*.txt
+emails*.txt
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+*.log

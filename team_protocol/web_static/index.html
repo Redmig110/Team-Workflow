@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f6f5">
+  <meta name="description" content="本地管理空间账号、执行队列、运行记录和加密设置。">
+  <title>Team Workflow Console</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+
+  <header class="topbar">
+    <div class="brand" translate="no">
+      <span class="brand-mark" aria-hidden="true">TW</span>
+      <span class="brand-copy">
+        <strong>Team Workflow</strong>
+        <small>本地运营控制台</small>
+      </span>
+    </div>
+
+    <nav class="primary-nav" aria-label="主要导航">
+      <a href="#spaces" class="nav-link is-active" data-view-link="spaces" aria-current="page">
+        <span class="nav-label-full">空间任务</span><span class="nav-label-short">空间</span>
+      </a>
+      <a href="#accounts" class="nav-link" data-view-link="accounts">
+        <span class="nav-label-full">账号库</span><span class="nav-label-short">账号</span>
+      </a>
+      <a href="#runs" class="nav-link" data-view-link="runs">
+        <span class="nav-label-full">运行历史</span><span class="nav-label-short">历史</span>
+      </a>
+      <a href="#settings" class="nav-link" data-view-link="settings">
+        <span>设置</span>
+      </a>
+    </nav>
+
+    <div class="connection-status" id="connection-status" data-state="connecting" role="status" aria-live="polite">
+      <span class="connection-dot" aria-hidden="true"></span>
+      <span id="connection-label">正在连接…</span>
+    </div>
+  </header>
+
+  <div class="migration-banner" id="migration-banner" role="alert" hidden>
+    <div>
+      <strong>迁移清理尚未完成</strong>
+      <span id="migration-message">普通操作已锁定，完成清理后即可继续。</span>
+    </div>
+    <button type="button" class="button button--danger" data-action="retry-migration-cleanup">重试清理</button>
+  </div>
+
+  <main id="main-content" tabindex="-1">
+    <section class="view is-active" id="view-spaces" data-view="spaces" aria-labelledby="spaces-title">
+      <header class="page-heading">
+        <div>
+          <p class="eyebrow">WORKSPACES</p>
+          <h1 id="spaces-title">空间任务</h1>
+        </div>
+        <div class="heading-actions">
+          <button type="button" class="button" data-action="open-workspace-dialog">新增空间</button>
+          <button type="button" class="button button--primary" id="enqueue-selected" data-action="enqueue-selected" disabled>加入队列</button>
+        </div>
+      </header>
+
+      <div class="metric-strip" aria-label="空间概览">
+        <div class="metric"><span>全部空间</span><strong id="metric-total">0</strong></div>
+        <div class="metric metric--ready"><span>可执行</span><strong id="metric-ready">0</strong></div>
+        <div class="metric metric--waiting"><span>待分配</span><strong id="metric-needs-account">0</strong></div>
+        <div class="metric metric--failed"><span>需处理</span><strong id="metric-attention">0</strong></div>
+      </div>
+
+      <div class="table-toolbar">
+        <label class="search-control">
+          <span class="sr-only">搜索空间</span>
+          <span class="search-icon" aria-hidden="true"></span>
+          <input id="workspace-search" name="workspace_search" type="search" placeholder="搜索空间、账号或 Workspace ID…" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="segmented-control" id="workspace-status-filter" aria-label="空间状态筛选">
+          <button type="button" class="is-active" data-action="filter-workspaces" data-status="all" aria-pressed="true">全部</button>
+          <button type="button" data-action="filter-workspaces" data-status="ready" aria-pressed="false">可执行</button>
+          <button type="button" data-action="filter-workspaces" data-status="needs_account" aria-pressed="false">待分配</button>
+          <button type="button" data-action="filter-workspaces" data-status="failed" aria-pressed="false">失败</button>
+        </div>
+        <span class="selection-count" id="workspace-selection-count" aria-live="polite">已选 0 项</span>
+      </div>
+
+      <div class="table-frame" id="workspace-table-frame">
+        <table class="data-table workspace-table">
+          <caption class="sr-only">空间、绑定账号和最近运行状态</caption>
+          <thead>
+            <tr>
+              <th class="selection-cell" scope="col">
+                <label class="check-control check-control--solo">
+                  <input id="select-all-workspaces" type="checkbox" aria-label="选择当前列表全部空间">
+                  <span aria-hidden="true"></span>
+                </label>
+              </th>
+              <th scope="col">空间</th>
+              <th scope="col">Workspace ID</th>
+              <th scope="col">当前账号</th>
+              <th scope="col">下一账号</th>
+              <th scope="col">状态</th>
+              <th scope="col">最近运行</th>
+              <th class="actions-cell" scope="col">操作</th>
+            </tr>
+          </thead>
+          <tbody id="workspace-table-body">
+            <tr class="loading-row"><td colspan="8"><span class="inline-loader" aria-hidden="true"></span>正在载入空间…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="view" id="view-accounts" data-view="accounts" aria-labelledby="accounts-title" hidden>
+      <header class="page-heading">
+        <div>
+          <p class="eyebrow">ACCOUNT LIBRARY</p>
+          <h1 id="accounts-title">账号库</h1>
+        </div>
+        <div class="heading-actions">
+          <button type="button" class="button button--primary" data-action="open-account-import">导入 Hotmail TXT</button>
+        </div>
+      </header>
+
+      <div class="section-tabs" role="tablist" aria-label="账号库视图">
+        <button type="button" id="account-used-tab" class="is-active" role="tab" aria-selected="true" aria-controls="account-used-panel" data-action="select-account-view" data-account-view="used">已用账号</button>
+        <button type="button" id="account-inventory-tab" role="tab" aria-selected="false" aria-controls="account-inventory-panel" data-action="select-account-view" data-account-view="inventory">邮箱库存</button>
+      </div>
+
+      <div id="account-used-panel" role="tabpanel" aria-labelledby="account-used-tab">
+      <div class="metric-strip metric-strip--compact" aria-label="账号概览">
+        <div class="metric"><span>全部账号</span><strong id="account-metric-total">0</strong></div>
+        <div class="metric metric--ready"><span>可用</span><strong id="account-metric-available">0</strong></div>
+        <div class="metric metric--waiting"><span>退出待处理</span><strong id="account-metric-pending">0</strong></div>
+        <div class="metric"><span>已绑定</span><strong id="account-metric-bound">0</strong></div>
+      </div>
+
+      <div class="table-toolbar">
+        <label class="search-control">
+          <span class="sr-only">搜索账号</span>
+          <span class="search-icon" aria-hidden="true"></span>
+          <input id="account-search" name="account_search" type="search" placeholder="搜索邮箱或绑定空间…" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="select-control">
+          <span class="sr-only">账号状态</span>
+          <select id="account-status-filter" name="account_status" aria-label="按账号状态筛选">
+            <option value="all">全部状态</option>
+            <option value="available">可用</option>
+            <option value="bound_current">当前绑定</option>
+            <option value="bound_next">下一账号</option>
+            <option value="exited_pending">退出待处理</option>
+            <option value="retired">已退役</option>
+            <option value="disabled">已停用</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="table-frame">
+        <table class="data-table account-table">
+          <caption class="sr-only">账号状态与空间绑定</caption>
+          <thead><tr><th scope="col">邮箱</th><th scope="col">主邮箱</th><th scope="col">状态</th><th scope="col">绑定空间</th><th scope="col">来源</th><th scope="col">更新时间</th><th class="actions-cell" scope="col">操作</th></tr></thead>
+          <tbody id="account-table-body">
+            <tr class="loading-row"><td colspan="7"><span class="inline-loader" aria-hidden="true"></span>正在载入账号…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <nav class="table-pagination" aria-label="账号分页">
+        <span id="account-page-summary" role="status" aria-live="polite">第 0-0 条，共 0 条</span>
+        <div class="pagination-actions">
+          <button type="button" class="button button--quiet" data-action="account-page-prev" disabled>上一页</button>
+          <span id="account-page-indicator">1 / 1</span>
+          <button type="button" class="button button--quiet" data-action="account-page-next" disabled>下一页</button>
+        </div>
+      </nav>
+      </div>
+
+      <div id="account-inventory-panel" role="tabpanel" aria-labelledby="account-inventory-tab" hidden>
+        <div class="table-toolbar inventory-toolbar">
+          <label class="search-control">
+            <span class="sr-only">搜索邮箱库存</span>
+            <span class="search-icon" aria-hidden="true"></span>
+            <input id="inventory-search" name="inventory_search" type="search" placeholder="输入主邮箱搜索库存…" autocomplete="off" spellcheck="false" aria-describedby="inventory-search-status">
+          </label>
+          <label class="select-control">
+            <span class="sr-only">库存状态</span>
+            <select id="inventory-status-filter" name="inventory_status" aria-label="按库存状态筛选">
+              <option value="available">可用</option>
+              <option value="all">全部状态</option>
+              <option value="disabled">已禁用</option>
+              <option value="exhausted">已耗尽</option>
+            </select>
+          </label>
+          <span class="inventory-search-status" id="inventory-search-status" role="status" aria-live="polite">输入邮箱后搜索，最多显示 20 条</span>
+        </div>
+        <div class="table-frame">
+          <table class="data-table inventory-table">
+            <caption class="sr-only">邮箱库存搜索结果</caption>
+            <thead><tr><th scope="col">主邮箱</th><th scope="col">状态</th><th scope="col">下一个子号</th><th scope="col">最近失效</th><th class="actions-cell" scope="col">操作</th></tr></thead>
+            <tbody id="inventory-table-body">
+              <tr class="empty-row"><td colspan="5">输入邮箱搜索库存</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="view" id="view-runs" data-view="runs" aria-labelledby="runs-title" hidden>
+      <header class="page-heading">
+        <div>
+          <p class="eyebrow">RUN HISTORY</p>
+          <h1 id="runs-title">运行历史</h1>
+        </div>
+      </header>
+
+      <div class="table-toolbar table-toolbar--runs">
+        <label class="search-control">
+          <span class="sr-only">搜索运行记录</span>
+          <span class="search-icon" aria-hidden="true"></span>
+          <input id="run-search" name="run_search" type="search" placeholder="搜索空间、账号或运行 ID…" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="select-control">
+          <span class="sr-only">运行结果</span>
+          <select id="run-state-filter" name="run_state" aria-label="按运行结果筛选">
+            <option value="all">全部结果</option>
+            <option value="running">运行中</option>
+            <option value="succeeded">成功</option>
+            <option value="failed">失败</option>
+            <option value="cancelled">已停止</option>
+            <option value="queued">排队中</option>
+          </select>
+        </label>
+        <label class="date-control"><span>起始日期</span><input id="run-date-from" name="run_date_from" type="date" autocomplete="off"></label>
+      </div>
+
+      <div class="table-frame">
+        <table class="data-table run-table">
+          <caption class="sr-only">历史运行记录</caption>
+          <thead><tr><th scope="col">空间</th><th scope="col">账号快照</th><th scope="col">结果</th><th scope="col">当前阶段</th><th scope="col">开始时间</th><th scope="col">耗时</th><th class="actions-cell" scope="col">详情</th></tr></thead>
+          <tbody id="run-table-body">
+            <tr class="loading-row"><td colspan="7"><span class="inline-loader" aria-hidden="true"></span>正在载入历史…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="view" id="view-settings" data-view="settings" aria-labelledby="settings-title" hidden>
+      <header class="page-heading">
+        <div>
+          <p class="eyebrow">SETTINGS</p>
+          <h1 id="settings-title">设置</h1>
+        </div>
+      </header>
+
+      <form id="settings-form" class="settings-layout" novalidate>
+        <section class="settings-section" aria-labelledby="runtime-settings-title">
+          <header><h2 id="runtime-settings-title">运行环境</h2></header>
+          <div class="settings-fields">
+            <div class="field field--wide"><label for="settings-proxy">代理模板</label><input id="settings-proxy" name="proxy" type="password" placeholder="未更改" autocomplete="new-password"><span class="secret-state-row"><small id="proxy-secret-state">未设置</small><button type="button" class="text-action" data-action="toggle-secret-clear" data-secret="proxy">清除已保存值</button></span></div>
+            <label class="field field--wide"><span>输出目录</span><span class="compound-control"><input name="output_dir" type="text" placeholder="选择 CPA 输出目录…" autocomplete="off" spellcheck="false"><button type="button" class="button" data-action="choose-output-directory">选择</button></span></label>
+            <label class="field"><span>PAT 名称</span><input name="pat_name" type="text" placeholder="例如 workflow…" autocomplete="off" spellcheck="false"></label>
+            <label class="field"><span>PAT TTL（秒）</span><input name="pat_ttl" type="number" min="60" step="60" inputmode="numeric" autocomplete="off"></label>
+            <label class="field"><span>邀请等待（秒）</span><input name="invite_settle_seconds" type="number" min="0" step="0.5" inputmode="decimal" autocomplete="off"></label>
+          </div>
+        </section>
+
+        <section class="settings-section" aria-labelledby="cpa-settings-title">
+          <header><h2 id="cpa-settings-title">CPA 管理端</h2></header>
+          <div class="settings-fields">
+            <label class="field field--wide"><span>管理端地址</span><input name="management_url" type="url" placeholder="https://example.com…" autocomplete="url" spellcheck="false"></label>
+            <label class="field"><span>远端文件名</span><input name="management_filename" type="text" placeholder="留空使用自动名称…" autocomplete="off" spellcheck="false"></label>
+            <div class="field"><label for="settings-management-key">Management API Key</label><input id="settings-management-key" name="management_api_key" type="password" placeholder="未更改" autocomplete="new-password"><span class="secret-state-row"><small id="management-secret-state">未设置</small><button type="button" class="text-action" data-action="toggle-secret-clear" data-secret="management_api_key">清除已保存值</button></span></div>
+            <label class="switch-field"><input name="management_push" type="checkbox"><span aria-hidden="true"></span><b>生成后推送</b></label>
+            <label class="switch-field"><input name="management_overwrite" type="checkbox"><span aria-hidden="true"></span><b>允许覆盖远端同名文件</b></label>
+          </div>
+        </section>
+
+        <section class="settings-section" aria-labelledby="sub2api-settings-title">
+          <header><h2 id="sub2api-settings-title">Sub2API</h2></header>
+          <div class="settings-fields">
+            <label class="field field--wide"><span>服务地址</span><input name="sub2api_url" type="url" placeholder="https://sub2api.example.com…" autocomplete="url" spellcheck="false"></label>
+            <label class="field"><span>管理员邮箱</span><input name="sub2api_email" type="email" placeholder="admin@example.com…" autocomplete="username" spellcheck="false"></label>
+            <div class="field"><label for="settings-sub2api-password">管理员密码</label><input id="settings-sub2api-password" name="sub2api_password" type="password" placeholder="未更改" autocomplete="new-password"><span class="secret-state-row"><small id="sub2api-secret-state">未设置</small><button type="button" class="text-action" data-action="toggle-secret-clear" data-secret="sub2api_password">清除已保存值</button></span></div>
+            <label class="field"><span>并发数</span><input name="sub2api_concurrency" type="number" min="1" step="1" inputmode="numeric" autocomplete="off"></label>
+            <label class="field"><span>优先级</span><input name="sub2api_priority" type="number" step="1" inputmode="numeric" autocomplete="off"></label>
+            <label class="switch-field"><input name="sub2api_push" type="checkbox"><span aria-hidden="true"></span><b>生成后推送</b></label>
+          </div>
+        </section>
+
+        <section class="settings-section settings-section--backup" aria-labelledby="backup-settings-title">
+          <header><h2 id="backup-settings-title">加密备份</h2></header>
+          <div class="backup-actions">
+            <button type="button" class="button" data-action="create-backup">创建加密备份</button>
+            <button type="button" class="button" data-action="restore-backup">恢复备份</button>
+            <span id="backup-status" role="status" aria-live="polite">尚未创建备份</span>
+          </div>
+        </section>
+
+        <div class="settings-submit">
+          <span id="settings-save-state" role="status" aria-live="polite"></span>
+          <button type="submit" class="button button--primary">保存设置</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <aside class="queue-drawer" id="queue-drawer" data-expanded="false" aria-labelledby="queue-title">
+    <div class="queue-drawer__bar">
+      <button type="button" class="queue-toggle" data-action="toggle-queue" aria-expanded="false" aria-controls="queue-body">
+        <span class="queue-toggle__copy">
+          <strong id="queue-title">执行队列</strong>
+          <span id="queue-summary">0 项待执行</span>
+        </span>
+        <span class="queue-running" id="queue-running-summary">当前无运行任务</span>
+        <span class="chevron" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="button button--quiet" id="queue-pause-button" data-action="toggle-queue-pause">暂停队列</button>
+    </div>
+    <div class="queue-drawer__body" id="queue-body" hidden>
+      <div class="queue-state" id="queue-state" role="status" aria-live="polite"></div>
+      <ol class="queue-list" id="queue-list">
+        <li class="empty-state">队列为空</li>
+      </ol>
+    </div>
+  </aside>
+
+  <dialog class="side-dialog" id="workspace-dialog" aria-labelledby="workspace-dialog-title">
+    <form method="dialog" class="dialog-shell" id="workspace-form" novalidate>
+      <header class="dialog-header">
+        <div><p class="eyebrow">WORKSPACE</p><h2 id="workspace-dialog-title">新增空间</h2></div>
+        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭空间编辑">×</button>
+      </header>
+      <div class="dialog-content">
+        <input type="hidden" name="workspace_id">
+        <input type="hidden" name="version">
+        <label class="field"><span>空间名称</span><input name="name" type="text" required placeholder="例如 巴西 Team 01…" autocomplete="off"></label>
+        <label class="field"><span>Workspace ID</span><input name="workspace_uid" type="text" required placeholder="输入 Workspace ID…" autocomplete="off" spellcheck="false"></label>
+        <div class="field combobox-field" data-combobox="current">
+          <label for="workspace-current-account">当前账号</label>
+          <div class="account-combobox">
+            <input id="workspace-current-account" type="text" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="workspace-current-options" aria-describedby="workspace-current-status" autocomplete="off" spellcheck="false" placeholder="搜索已用账号或邮箱库存…" data-combobox-input="current">
+            <input type="hidden" name="current_account_id">
+            <input type="hidden" name="current_inventory_id">
+            <button type="button" class="combobox-clear" data-action="clear-combobox" data-role="current" aria-label="清除当前账号选择">×</button>
+            <ul id="workspace-current-options" class="combobox-options" role="listbox" aria-label="当前账号搜索结果" hidden></ul>
+          </div>
+          <small id="workspace-current-status" class="combobox-status" role="status" aria-live="polite">请选择当前账号</small>
+        </div>
+        <div class="field combobox-field" data-combobox="next">
+          <label for="workspace-next-account">下一账号</label>
+          <div class="account-combobox">
+            <input id="workspace-next-account" type="text" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="workspace-next-options" aria-describedby="workspace-next-status" autocomplete="off" spellcheck="false" placeholder="搜索已用账号或邮箱库存…" data-combobox-input="next">
+            <input type="hidden" name="next_account_id">
+            <input type="hidden" name="next_inventory_id">
+            <button type="button" class="combobox-clear" data-action="clear-combobox" data-role="next" aria-label="清除下一账号选择">×</button>
+            <ul id="workspace-next-options" class="combobox-options" role="listbox" aria-label="下一账号搜索结果" hidden></ul>
+          </div>
+          <small id="workspace-next-status" class="combobox-status" role="status" aria-live="polite">请选择下一账号</small>
+        </div>
+        <div class="form-error" id="workspace-form-error" role="alert" hidden></div>
+      </div>
+      <footer class="dialog-footer">
+        <button type="button" class="button" data-action="close-dialog">取消</button>
+        <button type="submit" class="button button--primary">保存空间</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="side-dialog side-dialog--detail" id="run-dialog" aria-labelledby="run-dialog-title">
+    <div class="dialog-shell">
+      <header class="dialog-header">
+        <div><p class="eyebrow">RUN DETAIL</p><h2 id="run-dialog-title">运行详情</h2></div>
+        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭运行详情">×</button>
+      </header>
+      <div class="dialog-content dialog-content--run" id="run-detail-content">
+        <div class="loading-block"><span class="inline-loader" aria-hidden="true"></span>正在载入运行详情…</div>
+      </div>
+      <footer class="dialog-footer" id="run-dialog-footer">
+        <button type="button" class="button" data-action="close-dialog">关闭</button>
+      </footer>
+    </div>
+  </dialog>
+
+  <dialog class="modal-dialog" id="account-import-dialog" aria-labelledby="account-import-title">
+    <form method="dialog" class="dialog-shell" id="account-import-form" novalidate>
+      <header class="dialog-header">
+        <div><p class="eyebrow">IMPORT</p><h2 id="account-import-title">导入 Hotmail TXT</h2></div>
+        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭账号导入">×</button>
+      </header>
+      <div class="dialog-content">
+        <label class="field"><span>库存文件</span><span class="compound-control"><input name="path" type="text" required readonly placeholder="选择 TXT 文件…" autocomplete="off"><button type="button" class="button" data-action="choose-account-file">选择</button></span></label>
+        <div class="form-error" id="account-import-error" role="alert" hidden></div>
+      </div>
+      <footer class="dialog-footer">
+        <button type="button" class="button" data-action="close-dialog">取消</button>
+        <button type="submit" class="button button--primary">导入库存</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal-dialog" id="account-allocation-dialog" aria-labelledby="account-allocation-title">
+    <form method="dialog" class="dialog-shell" id="account-allocation-form" novalidate>
+      <header class="dialog-header">
+        <div><p class="eyebrow">MAILBOX INVENTORY</p><h2 id="account-allocation-title">分配子号</h2></div>
+        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭子号分配">×</button>
+      </header>
+      <div class="dialog-content">
+        <input type="hidden" name="inventory_id">
+        <dl class="allocation-preview">
+          <div><dt>主邮箱</dt><dd id="allocation-primary-email">-</dd></div>
+          <div><dt>系统分配</dt><dd id="allocation-next-alias">-</dd></div>
+        </dl>
+        <div class="form-error" id="account-allocation-error" role="alert" hidden></div>
+      </div>
+      <footer class="dialog-footer">
+        <button type="button" class="button" data-action="close-dialog">取消</button>
+        <button type="submit" class="button button--primary">确认分配</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <div class="toast-region" id="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
