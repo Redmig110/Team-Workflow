@@ -28,7 +28,7 @@ class ManagementClient:
         api_key: str,
         *,
         timeout: float = 20.0,
-        impersonate: str = "chrome110",
+        impersonate: str = "chrome145",
     ):
         try:
             from curl_cffi import requests as curl_requests

@@ -118,7 +118,7 @@
           <h1 id="accounts-title">账号库</h1>
         </div>
         <div class="heading-actions">
-          <button type="button" class="button button--primary" data-action="open-account-import">导入 Hotmail TXT</button>
+          <button type="button" class="button button--primary" data-action="open-account-import">导入 Outlook / Hotmail TXT</button>
         </div>
       </header>
 
@@ -282,6 +282,7 @@
             <div class="field"><label for="settings-sub2api-password">管理员密码</label><input id="settings-sub2api-password" name="sub2api_password" type="password" placeholder="未更改" autocomplete="new-password"><span class="secret-state-row"><small id="sub2api-secret-state">未设置</small><button type="button" class="text-action" data-action="toggle-secret-clear" data-secret="sub2api_password">清除已保存值</button></span></div>
             <label class="field"><span>并发数</span><input name="sub2api_concurrency" type="number" min="1" step="1" inputmode="numeric" autocomplete="off"></label>
             <label class="field"><span>优先级</span><input name="sub2api_priority" type="number" step="1" inputmode="numeric" autocomplete="off"></label>
+            <label class="field"><span>目标分组</span><select name="sub2api_group_id"><option value="">默认分组</option></select></label>
             <label class="switch-field"><input name="sub2api_push" type="checkbox"><span aria-hidden="true"></span><b>生成后推送</b></label>
           </div>
         </section>
@@ -383,7 +384,7 @@
   <dialog class="modal-dialog" id="account-import-dialog" aria-labelledby="account-import-title">
     <form method="dialog" class="dialog-shell" id="account-import-form" novalidate>
       <header class="dialog-header">
-        <div><p class="eyebrow">IMPORT</p><h2 id="account-import-title">导入 Hotmail TXT</h2></div>
+        <div><p class="eyebrow">IMPORT</p><h2 id="account-import-title">导入 Outlook / Hotmail TXT</h2></div>
         <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭账号导入">×</button>
       </header>
       <div class="dialog-content">

@@ -2,9 +2,9 @@
 
 const STEP_DEFINITIONS = [
   ["old_login", "旧号登录"],
+  ["new_login", "新号注册"],
   ["invite", "邀请新号"],
   ["old_leave", "旧号退出"],
-  ["new_login", "新号注册"],
   ["pat", "创建令牌"],
   ["cpa", "生成 CPA"],
   ["push", "推送管理端"],
@@ -111,6 +111,7 @@ const state = {
   },
   errors: {},
   settingsDirty: false,
+  sub2apiGroups: [],
   clearSecrets: new Set(),
   queueExpanded: false,
   accountPage: 1,
@@ -130,6 +131,7 @@ const state = {
   eventSource: null,
   lastEventSequence: 0,
 };
+let requestTokenRefreshPromise = null;
 
 const comboboxes = new Map(["current", "next"].map((role) => [role, {
   role,
@@ -252,6 +254,27 @@ function normalizedError(payload, status) {
   return new ApiError(message, {status, code, fields});
 }
 
+async function refreshRequestToken() {
+  if (requestTokenRefreshPromise) return requestTokenRefreshPromise;
+  requestTokenRefreshPromise = (async () => {
+    const response = await fetch("/api/bootstrap", {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    const payload = await response.json();
+    if (!response.ok) throw normalizedError(payload, response.status);
+    const token = safeString(firstValue(payload, ["request_token", "csrf_token", "token"]));
+    if (!token) throw new ApiError("本地服务未返回请求令牌", {code: "missing_request_token"});
+    state.requestToken = token;
+    return token;
+  })();
+  try {
+    return await requestTokenRefreshPromise;
+  } finally {
+    requestTokenRefreshPromise = null;
+  }
+}
+
 async function api(path, options = {}) {
   const controller = new AbortController();
   const timeout = Number(options.timeout || 20000);
@@ -293,7 +316,19 @@ async function api(path, options = {}) {
       const text = await response.text();
       payload = text ? {detail: text} : null;
     }
-    if (!response.ok) throw normalizedError(payload, response.status);
+    if (!response.ok) {
+      const error = normalizedError(payload, response.status);
+      if (
+        response.status === 403
+        && error.code === "invalid_request_token"
+        && !options.requestTokenRetried
+      ) {
+        await refreshRequestToken();
+        connectEvents();
+        return api(path, {...options, requestTokenRetried: true});
+      }
+      throw error;
+    }
     return payload;
   } catch (error) {
     if (error?.name === "AbortError") {
@@ -1008,12 +1043,64 @@ function safeSettings(payload, previous = {}) {
     sub2api_push: booleanValue(firstValue(settings, ["sub2api_push", "push_sub2api"], false)),
     sub2api_concurrency: firstValue(settings, ["sub2api_concurrency"], ""),
     sub2api_priority: firstValue(settings, ["sub2api_priority"], ""),
+    sub2api_group_id: firstValue(settings, ["sub2api_group_id"], ""),
     proxy_configured: configuredSecret(secrets, ["proxy", "proxy_configured", "proxy_present"], previous.proxy_configured),
     management_api_key_configured: configuredSecret(secrets, ["management_api_key", "management_api_key_configured", "management_key_present"], previous.management_api_key_configured),
     sub2api_password_configured: configuredSecret(secrets, ["sub2api_password", "sub2api_password_configured", "sub2api_password_present"], previous.sub2api_password_configured),
     last_backup_path: safeString(firstValue(settings, ["last_backup_path", "backup_path"])),
     last_backup_at: firstValue(settings, ["last_backup_at"]),
   };
+}
+
+function safeSub2APIGroups(payload) {
+  return asList(payload, ["groups"])
+    .map((item) => ({
+      id: Number(firstValue(item, ["id"], 0)),
+      name: safeString(firstValue(item, ["name"])).trim(),
+      platform: safeString(firstValue(item, ["platform"])).trim().toLowerCase(),
+      status: safeString(firstValue(item, ["status"], "active")).trim().toLowerCase(),
+      is_exclusive: booleanValue(firstValue(item, ["is_exclusive"], false)),
+    }))
+    .filter((item) => Number.isInteger(item.id) && item.id > 0 && item.name);
+}
+
+function renderSub2APIGroupOptions(form, selectedValue) {
+  const control = form.elements.namedItem("sub2api_group_id");
+  if (!(control instanceof HTMLSelectElement)) return;
+  const selected = safeString(selectedValue);
+  const fragment = document.createDocumentFragment();
+  fragment.append(element("option", {text: "默认分组", attrs: {value: ""}}));
+  let selectedExists = !selected;
+  for (const group of state.sub2apiGroups) {
+    const compatible = group.platform === "openai" && group.status === "active";
+    const isSelected = String(group.id) === selected;
+    const label = [
+      group.name,
+      group.platform ? group.platform.toUpperCase() : "未指定平台",
+      `ID ${group.id}`,
+      group.status && group.status !== "active" ? group.status : "",
+    ].filter(Boolean).join(" · ");
+    const option = element("option", {
+      text: label,
+      attrs: {value: group.id, disabled: !compatible && !isSelected},
+    });
+    if (isSelected) selectedExists = true;
+    fragment.append(option);
+  }
+  if (selected && !selectedExists) {
+    fragment.append(element("option", {
+      text: `已保存分组 · ID ${selected}`,
+      attrs: {value: selected},
+    }));
+  }
+  if (!state.sub2apiGroups.length) {
+    fragment.append(element("option", {
+      text: state.errors.sub2apiGroups ? "分组加载失败" : "没有可用分组",
+      attrs: {disabled: true},
+    }));
+  }
+  control.replaceChildren(fragment);
+  control.value = selectedExists ? selected : "";
 }
 
 function renderSecretControls(form = byId("settings-form")) {
@@ -1061,6 +1148,7 @@ function renderSettings({force = false} = {}) {
     const control = form.elements.namedItem(name);
     if (control) control.checked = Boolean(values[name]);
   }
+  renderSub2APIGroupOptions(form, values.sub2api_group_id);
   for (const name of ["proxy", "management_api_key", "sub2api_password"]) {
     const control = form.elements.namedItem(name);
     if (control) control.value = "";
@@ -1086,6 +1174,7 @@ function updateResource(name, payload) {
   if (name === "runs") state.runs = asList(payload, ["runs"]);
   if (name === "queue") state.queue = normalizeQueue(payload);
   if (name === "settings") state.settings = safeSettings(payload, state.settings);
+  if (name === "sub2apiGroups") state.sub2apiGroups = safeSub2APIGroups(payload);
 }
 
 async function loadResource(name, path, {optional = false} = {}) {
@@ -1112,6 +1201,7 @@ async function refreshResources(names) {
     runs: "/api/runs",
     queue: "/api/queue",
     settings: "/api/settings",
+    sub2apiGroups: "/api/sub2api/groups",
   };
   await Promise.all(names.map((name) => loadResource(name, paths[name])));
   renderAll();
@@ -1220,7 +1310,14 @@ function connectEvents() {
   const source = new EventSource(`/api/events?${query.toString()}`);
   state.eventSource = source;
   source.addEventListener("open", () => setConnection("connected", "本地服务已连接"));
-  source.addEventListener("error", () => setConnection("recovering", "正在恢复连接…"));
+  source.addEventListener("error", () => {
+    setConnection("recovering", "正在恢复连接…");
+    void refreshRequestToken()
+      .then(() => {
+        if (state.eventSource === source) connectEvents();
+      })
+      .catch(() => {});
+  });
   for (const eventType of ["reset", "run_event", "queue", "workspace", "account", "run", "settings", "migration", "inventory_changed"]) {
     source.addEventListener(eventType, (event) => parseEvent(event, eventType));
   }
@@ -1827,7 +1924,7 @@ async function handleAccountImport(form) {
   fieldError("account-import-error", "");
   const path = safeString(new FormData(form).get("path")).trim();
   if (!path) {
-    fieldError("account-import-error", "请选择 Hotmail TXT 文件");
+    fieldError("account-import-error", "请选择 Outlook / Hotmail TXT 文件");
     return;
   }
   const payload = await api("/api/accounts/import", {method: "POST", body: {path}});
@@ -1942,6 +2039,8 @@ function settingsPayload(form) {
     const raw = safeString(data.get(name)).trim();
     if (raw) values[name] = Number(raw);
   }
+  const sub2apiGroupId = safeString(data.get("sub2api_group_id")).trim();
+  values.sub2api_group_id = sub2apiGroupId ? Number(sub2apiGroupId) : "";
   const secrets = {};
   for (const secretName of ["proxy", "management_api_key", "sub2api_password"]) {
     const value = safeString(data.get(secretName));
@@ -1970,6 +2069,9 @@ async function handleSettingsSubmit(form) {
   renderSettings({force: true});
   byId("settings-save-state").textContent = `已保存 · ${formatDate(new Date().toISOString())}`;
   showToast("设置已保存", "success");
+  void loadResource("sub2apiGroups", "/api/sub2api/groups").then(() => {
+    renderSettings();
+  });
 }
 
 document.addEventListener("click", (event) => {
@@ -2216,6 +2318,7 @@ async function bootstrap() {
       loadResource("runs", "/api/runs"),
       loadResource("queue", "/api/queue"),
       loadResource("settings", "/api/settings"),
+      loadResource("sub2apiGroups", "/api/sub2api/groups"),
       loadResource("migration", "/api/migration/status", {optional: true}),
     ]);
     renderAll();

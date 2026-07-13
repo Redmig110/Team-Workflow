@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
@@ -10,6 +11,9 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 _LOGIN_PATCH_LOCK = threading.RLock()
+_PROXY_SID_RE = re.compile(r"(?i)(-sid-)([^-]+)")
+_PROXY_REGION_RE = re.compile(r"(?i)(?:^|-)region-([A-Za-z]{2})(?:-|$)")
+_PROXY_SID_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 
 class _CallbackEventQueue:
@@ -82,13 +86,111 @@ def _render_proxy_template(value: str, index: int) -> str:
     )
 
 
+def generate_proxy_sid(length: int = 8) -> str:
+    size = int(length)
+    if not 8 <= size <= 32:
+        raise ValueError("proxy SID length must be between 8 and 32")
+    return "".join(secrets.choice(_PROXY_SID_ALPHABET) for _ in range(size))
+
+
+def _validated_proxy_sid(value: str) -> str:
+    sid = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9]{8,32}", sid):
+        raise ValueError("proxy SID must be 8-32 ASCII letters or digits")
+    return sid
+
+
+def bind_proxy_sid(value: str, sid: str, *, required: bool = False) -> str:
+    proxy = _normalize_proxy_url(value)
+    if not proxy:
+        return ""
+    stable_sid = _validated_proxy_sid(sid)
+    parsed = urllib.parse.urlsplit(proxy)
+    userinfo, separator, hostinfo = parsed.netloc.rpartition("@")
+    if not separator:
+        if required:
+            raise ValueError("account-level proxy SID requires proxy userinfo")
+        return proxy
+    username_raw, password_separator, password_raw = userinfo.partition(":")
+    username = urllib.parse.unquote(username_raw)
+    replacements = 0
+
+    placeholder_count = username.count("{sid}")
+    if placeholder_count:
+        if placeholder_count != 1:
+            raise ValueError("proxy username must contain exactly one {sid} placeholder")
+        username = username.replace("{sid}", stable_sid)
+        replacements += 1
+
+    sid_matches = list(_PROXY_SID_RE.finditer(username))
+    if sid_matches:
+        if len(sid_matches) != 1:
+            raise ValueError("proxy username must contain exactly one -sid- value")
+        username = _PROXY_SID_RE.sub(
+            lambda match: f"{match.group(1)}{stable_sid}",
+            username,
+            count=1,
+        )
+        replacements += 1
+
+    stable_short = stable_sid[:8]
+    stable_long = hashlib.sha256(stable_sid.encode("ascii")).hexdigest()[:16]
+    template_replacements = {
+        "{worker}": "1",
+        "{index}": "1",
+        "{rand}": stable_short,
+        "{rand8}": stable_short,
+        "{rand16}": stable_long,
+    }
+    for placeholder, replacement in template_replacements.items():
+        if placeholder in username:
+            username = username.replace(placeholder, replacement)
+            replacements += 1
+
+    rewritten_parts: dict[str, str] = {}
+    for part_name in ("path", "query", "fragment"):
+        part_value = str(getattr(parsed, part_name) or "")
+        for placeholder, replacement in template_replacements.items():
+            if placeholder in part_value:
+                part_value = part_value.replace(placeholder, replacement)
+                replacements += 1
+        rewritten_parts[part_name] = part_value
+
+    if required and replacements == 0:
+        raise ValueError(
+            "proxy username must contain {sid}, -sid-<value>, or a stable rand placeholder"
+        )
+    encoded_username = urllib.parse.quote(
+        username,
+        safe="!$&'()*+,;=-._~",
+    )
+    encoded_userinfo = encoded_username
+    if password_separator:
+        encoded_userinfo += f":{password_raw}"
+    rebound = parsed._replace(
+        netloc=f"{encoded_userinfo}@{hostinfo}",
+        **rewritten_parts,
+    )
+    return urllib.parse.urlunsplit(rebound)
+
+
+def proxy_region_code(value: str) -> str:
+    proxy = _normalize_proxy_url(value)
+    if not proxy:
+        return ""
+    parsed = urllib.parse.urlsplit(proxy)
+    username = urllib.parse.unquote(parsed.username or "")
+    match = _PROXY_REGION_RE.search(username)
+    return "" if match is None else match.group(1).upper()
+
+
 def _mask_proxy_for_log(value: str) -> str:
     text = _normalize_proxy_url(value)
     if not text:
         return "直连"
     return re.sub(
-        r"([A-Za-z][A-Za-z0-9+.-]*://[^:/@\s]+:)([^@\s]+)(@)",
-        r"\1******\3",
+        r"([A-Za-z][A-Za-z0-9+.-]*://)[^@/\s]+@",
+        r"\1******@",
         text,
     )
 
@@ -157,7 +259,13 @@ class RegistrarIdentityError(RuntimeError):
 
 class RegistrarAdapter:
     def __init__(self, state_dir: str | Path | None = None):
-        from .registrar_runtime import appleemail_provider, fingerprint_profiles, register
+        from .proxy_geo import resolve_proxy_geo
+        from .registrar_runtime import (
+            appleemail_provider,
+            fingerprint_profiles,
+            register,
+            sentinel_browser,
+        )
 
         self.state_dir = Path(state_dir or Path.cwd() / "output" / ".registrar").resolve()
         self._login = register.login_existing_account_for_token
@@ -169,10 +277,35 @@ class RegistrarAdapter:
         )
         self._create_session_profile = fingerprint_profiles.create_session_profile
         self._session_profile_class = fingerprint_profiles.SessionProfile
+        self._resolve_proxy_geo = resolve_proxy_geo
+        self._browserforge_fingerprint_for_profile = (
+            sentinel_browser._browserforge_fingerprint_for_profile
+        )
+        self._restore_browserforge_fingerprint = (
+            sentinel_browser.restore_browserforge_fingerprint
+        )
+        self._serialize_browserforge_fingerprint = (
+            sentinel_browser.serialize_browserforge_fingerprint
+        )
+        self._browser_toolchain_metadata = sentinel_browser.browser_toolchain_metadata
 
-    def resolve_session_profile(self, serialized: Mapping[str, Any] | None = None) -> Any:
+    def resolve_proxy_geo(self, proxy: str | None) -> dict[str, Any]:
+        hint = self._resolve_proxy_geo(proxy)
+        if not isinstance(hint, Mapping):
+            raise RuntimeError("proxy geo resolver did not return an object")
+        return dict(hint)
+
+    def resolve_session_profile(
+        self,
+        serialized: Mapping[str, Any] | None = None,
+        *,
+        geo_hint: Mapping[str, Any] | None = None,
+    ) -> Any:
         if serialized is None:
-            return self._create_session_profile(scope="auto_desktop")
+            return self._create_session_profile(
+                scope="auto_desktop",
+                geo_hint=geo_hint,
+            )
         if not isinstance(serialized, Mapping):
             raise ValueError("stored fingerprint profile must be a JSON object")
         try:
@@ -192,6 +325,28 @@ class RegistrarAdapter:
             raise ValueError("fingerprint profile serializer did not return an object")
         json.dumps(payload, ensure_ascii=False)
         return payload
+
+    def resolve_browserforge_fingerprint(
+        self,
+        profile: Any,
+        serialized: Mapping[str, Any] | None = None,
+    ) -> Any:
+        if serialized is not None:
+            if not isinstance(serialized, Mapping):
+                raise ValueError("stored BrowserForge fingerprint must be an object")
+            return self._restore_browserforge_fingerprint(profile, dict(serialized))
+        return self._browserforge_fingerprint_for_profile(
+            profile,
+            fingerprint_scope=str(getattr(profile, "scope", "auto_desktop")),
+        )
+
+    def serialize_browserforge_fingerprint(self, fingerprint: Any) -> dict[str, Any]:
+        payload = self._serialize_browserforge_fingerprint(fingerprint)
+        json.dumps(payload, ensure_ascii=False)
+        return payload
+
+    def browser_toolchain_metadata(self, profile: Any) -> dict[str, Any]:
+        return dict(self._browser_toolchain_metadata(profile))
 
     def login(
         self,
@@ -232,10 +387,17 @@ class RegistrarAdapter:
                 return None
             return closure.get("session")
 
+        def _is_workspace_selection_step(value: str) -> bool:
+            parsed = urllib.parse.urlsplit(str(value or "").strip())
+            if parsed.netloc and parsed.netloc.lower() != "auth.openai.com":
+                return False
+            path = parsed.path.rstrip("/").lower()
+            return path == "/workspace" or path.startswith("/workspace/")
+
         def _extract_with_workspace(*, continue_url: str, session_get: Any, **kwargs: Any):
             selected_url = str(continue_url or "").strip()
             target_workspace = str(workspace_id or "").strip()
-            if target_workspace:
+            if target_workspace and _is_workspace_selection_step(selected_url):
                 session = _session_from_closure(session_get)
                 if session is None:
                     raise RuntimeError("could not access registrar OAuth session for workspace selection")

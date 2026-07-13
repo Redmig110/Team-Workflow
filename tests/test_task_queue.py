@@ -56,6 +56,8 @@ class RunnerHarness:
                 "old_mailbox": kwargs["old_mailbox"],
                 "new_mailbox": kwargs["new_mailbox"],
                 "proxy": kwargs["expanded_proxy"],
+                "old_network": kwargs["old_network"],
+                "new_network": kwargs["new_network"],
                 "checkpoint_before": kwargs["checkpoint_store"].snapshot(),
             }
             self.calls.append(call)
@@ -129,7 +131,9 @@ class TaskQueueTests(unittest.TestCase):
         self.database.set_text_setting("management_push", "0")
         self.database.set_text_setting("sub2api_push", "0")
         self.database.set_secret_setting(
-            "proxy", "http://proxy-user:proxy-password@proxy.invalid:9000/{rand}"
+            "proxy",
+            "http://proxy-user-region-BR-sid-seed-t-60:"
+            "proxy-password@proxy.invalid:9000/{rand}",
         )
         self.queues = []
 
@@ -300,6 +304,23 @@ class TaskQueueTests(unittest.TestCase):
             wait_until(lambda: self.database.get_run(run["id"])["state"] == "succeeded")
         )
         self.assertEqual([call["proxy"] for call in harness.calls], [first_proxy, first_proxy])
+        self.assertNotEqual(
+            harness.calls[0]["old_network"].proxy,
+            harness.calls[0]["new_network"].proxy,
+        )
+        self.assertEqual(
+            [call["old_network"].proxy for call in harness.calls],
+            [harness.calls[0]["old_network"].proxy] * 2,
+        )
+        self.assertEqual(
+            [call["new_network"].proxy for call in harness.calls],
+            [harness.calls[0]["new_network"].proxy] * 2,
+        )
+        current_identity = self.database.get_account_network_identity(
+            workspace["current_account_id"]
+        )
+        next_identity = self.database.get_account_network_identity(next_account["id"])
+        self.assertNotEqual(current_identity["proxy_sid"], next_identity["proxy_sid"])
         self.assertIn("old_login", harness.calls[1]["checkpoint_before"])
         self.assertEqual(
             self.database.get_workspace(workspace["id"])["current_account_id"],
@@ -445,7 +466,22 @@ class TaskQueueTests(unittest.TestCase):
     def test_startup_recovers_the_same_interrupted_run(self):
         workspace, _, _ = self.make_workspace("recovery")
         run = self.database.enqueue_workspace(workspace["id"])
-        self.database.set_run_checkpoint(run["id"], {"invite": {"done": True}})
+        legacy_profile = {"profile_id": "legacy-shared-profile", "major": 142}
+        legacy_geo = {
+            "resolved": True,
+            "country_code": "BR",
+            "timezone_id": "America/Sao_Paulo",
+            "locale": "pt-BR",
+        }
+        self.database.set_run_checkpoint(
+            run["id"],
+            {
+                "new_login": {"done": True},
+                "invite": {"done": True},
+                "_fingerprint_profile": legacy_profile,
+                "_proxy_geo": legacy_geo,
+            },
+        )
         self.database.set_run_proxy(
             run["id"], "http://fixed-user:fixed-password@proxy.invalid:9000"
         )
@@ -462,6 +498,22 @@ class TaskQueueTests(unittest.TestCase):
         )
         self.assertEqual(harness.calls[0]["proxy"], self.database.get_run_proxy(run["id"]))
         self.assertEqual(harness.calls[0]["checkpoint_before"]["invite"], {"done": True})
+        self.assertTrue(harness.calls[0]["old_network"].legacy_recovery)
+        self.assertTrue(harness.calls[0]["new_network"].legacy_recovery)
+        self.assertEqual(
+            harness.calls[0]["old_network"].fingerprint_profile,
+            legacy_profile,
+        )
+        self.assertEqual(
+            harness.calls[0]["old_network"].proxy,
+            self.database.get_run_proxy(run["id"]),
+        )
+        self.assertNotIn(
+            "fingerprint_profile",
+            self.database.get_account_network_identity(
+                workspace["current_account_id"]
+            ),
+        )
         self.assertIn(
             "interrupted run recovered and requeued",
             [
@@ -513,6 +565,7 @@ class TaskQueueTests(unittest.TestCase):
         self.database.set_text_setting("pat_name", "database-pat")
         self.database.set_text_setting("pat_ttl", "600")
         self.database.set_text_setting("invite_settle_seconds", "4.5")
+        self.database.set_text_setting("sub2api_group_id", "3")
         self.database.set_secret_setting("management_api_key", "management-secret")
         harness = RunnerHarness("success")
         queue = self.make_queue(harness)
@@ -531,6 +584,7 @@ class TaskQueueTests(unittest.TestCase):
         self.assertEqual(call["config"].management_key, "management-secret")
         self.assertFalse(call["config"].push)
         self.assertFalse(call["config"].sub2api_push)
+        self.assertEqual(call["config"].sub2api_group_id, 3)
         self.assertEqual(call["old_mailbox"].registration_email, current["email"])
         self.assertEqual(call["new_mailbox"].registration_email, next_account["email"])
         self.assertEqual(call["old_mailbox"].refresh_token, "refresh-inputs-current")

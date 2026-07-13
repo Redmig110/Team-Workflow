@@ -29,7 +29,7 @@ def access_token():
     return f"{encode({'alg': 'none'})}.{encode(payload)}.signature"
 
 
-def account_payload(token="at-test"):
+def account_payload(token="at-test", group_id=None):
     return build_sub2api_account(
         {
             "accessToken": access_token(),
@@ -40,6 +40,7 @@ def account_payload(token="at-test"):
         personal_access_token=token,
         concurrency=10,
         priority=1,
+        group_id=group_id,
         now=datetime(2026, 7, 12, 9, 0, tzinfo=timezone.utc),
     )
 
@@ -118,10 +119,40 @@ class Sub2APIAccountTests(unittest.TestCase):
         create_call = session.calls[2]
         self.assertTrue(create_call[1].endswith("/admin/openai/create-from-codex-pat"))
         self.assertEqual(create_call[2]["json"]["access_token"], "at-test")
+        self.assertFalse(create_call[2]["json"]["skip_default_group_bind"])
         self.assertEqual(
             create_call[2]["json"]["credential_extras"]["chatgpt_account_id"],
             "workspace-1",
         )
+
+    def test_push_assigns_and_verifies_explicit_group(self):
+        account = account_payload(group_id=3)
+        session = QueueSession(
+            [
+                wrapped({"access_token": "admin-token"}),
+                wrapped({"exported_at": "2026-07-12T09:00:00Z", "accounts": []}),
+                wrapped({"id": 42, "name": account["name"]}),
+                wrapped(
+                    {
+                        "exported_at": "2026-07-12T09:00:01Z",
+                        "accounts": [account],
+                    }
+                ),
+            ]
+        )
+        client = Sub2APIClient(
+            "https://sub2api.example",
+            "admin@example.com",
+            "secret",
+            session=session,
+        )
+
+        result = client.push_account(account)
+
+        self.assertTrue(result.verified)
+        create_payload = session.calls[2][2]["json"]
+        self.assertEqual(create_payload["group_ids"], [3])
+        self.assertTrue(create_payload["skip_default_group_bind"])
 
     def test_push_skips_exact_remote_account(self):
         account = account_payload()
@@ -143,6 +174,34 @@ class Sub2APIAccountTests(unittest.TestCase):
         self.assertEqual(result.action, "skipped")
         self.assertTrue(result.verified)
         self.assertEqual(len(session.calls), 2)
+
+    def test_lists_all_groups_including_inactive(self):
+        session = QueueSession(
+            [
+                wrapped({"access_token": "admin-token"}),
+                wrapped(
+                    [
+                        {"id": 3, "name": "K12", "platform": "openai"},
+                        {"id": 4, "name": "Disabled", "status": "inactive"},
+                    ]
+                ),
+            ]
+        )
+        client = Sub2APIClient(
+            "https://sub2api.example",
+            "admin@example.com",
+            "secret",
+            session=session,
+        )
+
+        groups = client.list_groups(include_inactive=True)
+
+        self.assertEqual([group["id"] for group in groups], [3, 4])
+        self.assertTrue(
+            session.calls[1][1].endswith(
+                "/admin/groups/all?include_inactive=true"
+            )
+        )
 
     def test_push_rejects_same_identity_with_different_token(self):
         account = account_payload()

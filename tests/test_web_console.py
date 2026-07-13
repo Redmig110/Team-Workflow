@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -13,7 +15,9 @@ from fastapi.testclient import TestClient
 from team_protocol.database import Database
 from team_protocol.migration import CleanupFailure, CleanupResult, cleanup_plaintext
 from team_protocol.web_console import (
+    ConsoleAlreadyRunningError,
     WebConsoleController,
+    _ConsoleInstanceLock,
     _event_stream,
     create_app,
     serve_web_console,
@@ -195,6 +199,78 @@ class WebConsoleTests(unittest.TestCase):
             encoding="utf-8",
         )
         return config, mail
+
+    def test_console_instance_lock_rejects_second_owner_and_releases(self):
+        first = _ConsoleInstanceLock(self.root)
+        second = _ConsoleInstanceLock(self.root)
+        first.acquire()
+        try:
+            first.set_owner_url("http://127.0.0.1:9012")
+            with self.assertRaises(ConsoleAlreadyRunningError) as caught:
+                second.acquire()
+            self.assertEqual(caught.exception.url, "http://127.0.0.1:9012")
+        finally:
+            first.release()
+
+        second.acquire()
+        second.release()
+
+    def test_console_instance_lock_is_released_when_owner_process_exits(self):
+        script = (
+            "import sys, time\n"
+            "from team_protocol.web_console import _ConsoleInstanceLock\n"
+            "lock = _ConsoleInstanceLock(sys.argv[1])\n"
+            "lock.acquire()\n"
+            "lock.set_owner_url('http://127.0.0.1:9014')\n"
+            "print('locked', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(self.root)],
+            cwd=Path.cwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        contender = _ConsoleInstanceLock(self.root)
+        try:
+            self.assertEqual(process.stdout.readline().strip(), "locked")
+            with self.assertRaises(ConsoleAlreadyRunningError) as caught:
+                contender.acquire()
+            self.assertEqual(caught.exception.url, "http://127.0.0.1:9014")
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+        contender.acquire()
+        contender.release()
+
+    def test_second_server_uses_existing_instance_without_starting_controller(self):
+        owner = _ConsoleInstanceLock(self.root)
+        owner.acquire()
+        owner.set_owner_url("http://127.0.0.1:9013")
+        try:
+            with (
+                patch(
+                    "team_protocol.web_console.WebConsoleController",
+                    side_effect=AssertionError("second instance constructed a controller"),
+                ),
+                patch("team_protocol.web_console.webbrowser.open") as open_browser,
+            ):
+                result = serve_web_console(
+                    port=9012,
+                    open_browser=True,
+                    app_dir=self.root,
+                )
+        finally:
+            owner.release()
+
+        self.assertEqual(result, 0)
+        open_browser.assert_called_once_with("http://127.0.0.1:9013")
 
     def test_bootstrap_is_domain_shaped_and_redacts_all_secrets(self):
         self.workspace()
@@ -564,7 +640,11 @@ class WebConsoleTests(unittest.TestCase):
                 "/api/settings",
                 headers=self.origin_headers,
                 json={
-                    "values": {"output_dir": str(self.root / "output"), "sub2api_push": True},
+                    "values": {
+                        "output_dir": str(self.root / "output"),
+                        "sub2api_push": True,
+                        "sub2api_group_id": 3,
+                    },
                     "secrets": {"sub2api_password": ""},
                 },
             )
@@ -580,10 +660,54 @@ class WebConsoleTests(unittest.TestCase):
             )
 
         self.assertTrue(preserved.json()["secrets"]["sub2api_password"])
+        self.assertEqual(preserved.json()["values"]["sub2api_group_id"], "3")
         self.assertFalse(cleared.json()["secrets"]["sub2api_password"])
         self.assertNotIn("secret-canary", preserved.text + cleared.text)
         self.assertEqual(invalid.status_code, 422)
         self.assertIn("values", invalid.json()["detail"]["fields"])
+
+    def test_sub2api_groups_route_uses_saved_credentials_and_returns_safe_metadata(self):
+        self.database.set_text_setting("sub2api_base_url", "https://sub2api.example")
+        self.database.set_text_setting("sub2api_email", "admin@example.com")
+        self.database.set_secret_setting("sub2api_password", "secret-canary")
+        app = create_app(self.controller, testing=True)
+        with patch("team_protocol.web_console.Sub2APIClient") as client_class:
+            client = client_class.return_value.__enter__.return_value
+            client.list_groups.return_value = [
+                {
+                    "id": 3,
+                    "name": "K12",
+                    "platform": "openai",
+                    "status": "active",
+                    "is_exclusive": False,
+                    "private_field": "not-returned",
+                }
+            ]
+            with TestClient(app) as test_client:
+                response = test_client.get(
+                    "/api/sub2api/groups",
+                    headers={"X-Workflow-Token": self.controller.request_token},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "groups": [
+                    {
+                        "id": 3,
+                        "name": "K12",
+                        "platform": "openai",
+                        "status": "active",
+                        "is_exclusive": False,
+                    }
+                ]
+            },
+        )
+        client_class.assert_called_once_with(
+            "https://sub2api.example", "admin@example.com", "secret-canary"
+        )
+        client.list_groups.assert_called_once_with(include_inactive=True)
 
     def test_static_traversal_and_legacy_config_routes_are_absent(self):
         app = create_app(self.controller, testing=True)
@@ -604,9 +728,14 @@ class WebConsoleTests(unittest.TestCase):
 
         self.assertEqual(index.status_code, 200)
         self.assertEqual(script.status_code, 200)
+        self.assertIn("refreshRequestToken", script.text)
+        self.assertIn("invalid_request_token", script.text)
         self.assertIn("Content-Security-Policy", index.headers)
         self.assertIn('id="account-page-summary"', index.text)
         self.assertIn('data-action="account-page-next"', index.text)
+        self.assertIn('name="sub2api_group_id"', index.text)
+        self.assertIn('<select name="sub2api_group_id">', index.text)
+        self.assertIn('/api/sub2api/groups', script.text)
         self.assertIn("const ACCOUNT_PAGE_SIZE = 50", script.text)
         self.assertIn("const MOBILE_ACCOUNT_PAGE_SIZE = 20", script.text)
         self.assertIn(traversal.status_code, {400, 404})
@@ -835,7 +964,7 @@ class WebConsoleTests(unittest.TestCase):
             patch("team_protocol.web_console.uvicorn.Server") as server_type,
         ):
             server_type.return_value.run.return_value = None
-            result = serve_web_console(open_browser=False)
+            result = serve_web_console(open_browser=False, app_dir=self.root)
 
         self.assertEqual(result, 0)
         self.assertEqual(

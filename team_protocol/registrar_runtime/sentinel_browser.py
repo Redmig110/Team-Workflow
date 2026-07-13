@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.metadata
 import json
 import random
+import re
 import secrets
 import threading
 import uuid
@@ -11,6 +13,7 @@ from collections import OrderedDict
 from typing import Any, Dict, Optional, Sequence
 from urllib.parse import quote
 
+from ..playwright_proxy import PlaywrightProxyLease, apply_playwright_proxy
 from .fingerprint_profiles import (
     FingerprintEngineMetadata,
     SessionProfile,
@@ -311,6 +314,69 @@ def _browserforge_cache_key(profile: SessionProfile) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def serialize_browserforge_fingerprint(fingerprint: Any) -> Dict[str, Any]:
+    dumps = getattr(fingerprint, "dumps", None)
+    if not callable(dumps):
+        raise ValueError("BrowserForge fingerprint cannot be serialized")
+    payload = json.loads(dumps())
+    if not isinstance(payload, dict):
+        raise ValueError("BrowserForge fingerprint payload is not an object")
+    return payload
+
+
+def deserialize_browserforge_fingerprint(payload: Dict[str, Any]) -> Any:
+    if not isinstance(payload, dict):
+        raise ValueError("stored BrowserForge fingerprint must be an object")
+    try:
+        from browserforge.fingerprints.generator import (  # type: ignore
+            Fingerprint,
+            NavigatorFingerprint,
+            ScreenFingerprint,
+            VideoCard,
+        )
+
+        screen = payload.get("screen")
+        navigator = payload.get("navigator")
+        video_card = payload.get("videoCard")
+        if not isinstance(screen, dict) or not isinstance(navigator, dict):
+            raise ValueError("stored BrowserForge fingerprint is incomplete")
+        return Fingerprint(
+            screen=ScreenFingerprint(**screen),
+            navigator=NavigatorFingerprint(**navigator),
+            headers=dict(payload.get("headers") or {}),
+            videoCodecs=dict(payload.get("videoCodecs") or {}),
+            audioCodecs=dict(payload.get("audioCodecs") or {}),
+            pluginsData=dict(payload.get("pluginsData") or {}),
+            battery=(
+                dict(payload["battery"])
+                if isinstance(payload.get("battery"), dict)
+                else None
+            ),
+            videoCard=(
+                VideoCard(**video_card)
+                if isinstance(video_card, dict)
+                else None
+            ),
+            multimediaDevices=copy.deepcopy(payload.get("multimediaDevices") or []),
+            fonts=list(payload.get("fonts") or []),
+            mockWebRTC=payload.get("mockWebRTC"),
+            slim=payload.get("slim"),
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ValueError("stored BrowserForge fingerprint is incompatible") from exc
+
+
+def browser_toolchain_metadata(profile: SessionProfile) -> Dict[str, Any]:
+    profile.validate()
+    return {
+        "chrome_major": profile.major,
+        "impersonate": profile.impersonate,
+        "browserforge": importlib.metadata.version("browserforge"),
+        "curl_cffi": importlib.metadata.version("curl-cffi"),
+        "playwright": importlib.metadata.version("playwright"),
+    }
+
+
 def _canonicalize_browserforge_fingerprint(
     fingerprint: Any,
     profile: SessionProfile,
@@ -386,7 +452,7 @@ def _browserforge_fingerprint_for_profile(
             return copy.deepcopy(value)
 
         try:
-            from browserforge.fingerprints import FingerprintGenerator, Screen  # type: ignore
+            from browserforge.fingerprints import FingerprintGenerator  # type: ignore
 
             generator_options = browserforge_options_for_scope(fingerprint_scope)
             generator_options.update(
@@ -398,16 +464,22 @@ def _browserforge_fingerprint_for_profile(
                 }
             )
             generator = FingerprintGenerator(**generator_options)
-            screen = Screen(
-                min_width=int(profile.screen["width"]),
-                max_width=int(profile.screen["width"]),
-                min_height=int(profile.screen["height"]),
-                max_height=int(profile.screen["height"]),
+            sample_user_agent = re.sub(
+                r"Chrome/[0-9.]+",
+                f"Chrome/{profile.major}.0.0.0",
+                profile.user_agent,
+                count=1,
             )
+            if profile.browser == "edge":
+                sample_user_agent = re.sub(
+                    r"Edg/[0-9.]+",
+                    f"Edg/{profile.major}.0.0.0",
+                    sample_user_agent,
+                    count=1,
+                )
             fingerprint = generator.generate(
                 strict=True,
-                screen=screen,
-                user_agent=profile.user_agent,
+                user_agent=sample_user_agent,
             )
             generated_headers = getattr(fingerprint, "headers", {}) or {}
             generated_ua = str(
@@ -415,7 +487,7 @@ def _browserforge_fingerprint_for_profile(
                 or generated_headers.get("user-agent")
                 or ""
             ).strip()
-            if generated_ua != profile.user_agent:
+            if generated_ua != sample_user_agent:
                 raise RuntimeError(
                     "BrowserForge generated a different User-Agent"
                 )
@@ -440,6 +512,39 @@ def _browserforge_fingerprint_for_profile(
             _BROWSERFORGE_CACHE.popitem(last=False)
         return copy.deepcopy(fingerprint)
 
+
+def restore_browserforge_fingerprint(
+    profile: SessionProfile,
+    payload: Dict[str, Any],
+) -> Any:
+    fingerprint = _canonicalize_browserforge_fingerprint(
+        deserialize_browserforge_fingerprint(payload),
+        profile,
+    )
+    cache_key = _browserforge_cache_key(profile)
+    with _BROWSERFORGE_CACHE_LOCK:
+        _BROWSERFORGE_CACHE[cache_key] = (True, copy.deepcopy(fingerprint))
+        _BROWSERFORGE_CACHE.move_to_end(cache_key)
+        while len(_BROWSERFORGE_CACHE) > _BROWSERFORGE_CACHE_MAX_SIZE:
+            _BROWSERFORGE_CACHE.popitem(last=False)
+    return copy.deepcopy(fingerprint)
+
+
+def _assert_browser_profile_compatibility(
+    browser: Any,
+    profile: SessionProfile,
+) -> None:
+    profile.validate()
+    version = str(getattr(browser, "version", "") or "").strip()
+    match = re.match(r"(\d+)(?:\.|$)", version)
+    if match is None:
+        raise RuntimeError("Playwright Chromium version is unavailable")
+    actual_major = int(match.group(1))
+    if actual_major != profile.major:
+        raise RuntimeError(
+            f"Chromium major {actual_major} does not match account fingerprint {profile.major}"
+        )
+
 def _new_browserforge_context(
     browser: Any,
     *,
@@ -448,21 +553,51 @@ def _new_browserforge_context(
 ) -> Any:
     if session_profile is None:
         raise RuntimeError("BrowserForge requires an immutable SessionProfile")
+    _assert_browser_profile_compatibility(browser, session_profile)
 
-    from browserforge.injectors.playwright import NewContext  # type: ignore
+    from browserforge.injectors.playwright.injector import _context_options  # type: ignore
+    from browserforge.injectors.utils import (  # type: ignore
+        InjectFunction,
+        only_injectable_headers,
+    )
 
     fingerprint = _browserforge_fingerprint_for_profile(
         session_profile,
         fingerprint_scope=fingerprint_scope,
     )
-    context = NewContext(
-        browser,
-        fingerprint=fingerprint,
-        **context_options_for_profile(session_profile),
+    function = InjectFunction(fingerprint)
+    stable_history_length = 1 + int(
+        hashlib.sha256(session_profile.profile_id.encode("utf-8")).hexdigest()[:8],
+        16,
+    ) % 5
+    function, history_replacements = re.subn(
+        r"const historyLength = \d+;",
+        f"const historyLength = {stable_history_length};",
+        function,
+        count=1,
     )
-    context.add_init_script(
-        fingerprint_init_script_for_profile(session_profile)
+    if history_replacements != 1:
+        raise RuntimeError("BrowserForge history injection contract changed")
+    function, headless_replacements = re.subn(
+        r"const isHeadlessChromium = /headless/i\.test\(navigator\.userAgent\) && navigator\.plugins\.length === 0;",
+        "const isHeadlessChromium = navigator.plugins.length === 0;",
+        function,
+        count=1,
     )
+    if headless_replacements != 1:
+        raise RuntimeError("BrowserForge headless injection contract changed")
+
+    context_options = context_options_for_profile(session_profile)
+    context = browser.new_context(
+        **_context_options(fingerprint, context_options),
+    )
+    context.set_extra_http_headers(
+        only_injectable_headers(
+            fingerprint.headers,
+            browser.browser_type.name,
+        )
+    )
+    context.add_init_script(function)
 
     def _restore_media(page: Any) -> None:
         try:
@@ -475,6 +610,45 @@ def _new_browserforge_context(
 
     context.on("page", _restore_media)
     return context
+
+
+def create_browserforge_context(
+    browser: Any,
+    *,
+    fingerprint_scope: str,
+    session_profile: SessionProfile,
+) -> Any:
+    return _new_browserforge_context(
+        browser,
+        fingerprint_scope=fingerprint_scope,
+        session_profile=session_profile,
+    )
+
+
+def _create_required_browser_context(
+    browser: Any,
+    *,
+    requested_engine: str,
+    fingerprint_scope: str,
+    session_profile: SessionProfile,
+) -> tuple[Any, FingerprintEngineMetadata]:
+    engine = str(requested_engine or "browserforge").strip().lower()
+    if engine != "browserforge":
+        raise ValueError("BrowserForge is mandatory; internal and auto modes are disabled")
+    try:
+        context = create_browserforge_context(
+            browser,
+            fingerprint_scope=fingerprint_scope,
+            session_profile=session_profile,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"BrowserForge context creation failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    return context, resolve_fingerprint_engine(
+        "browserforge",
+        browserforge_available=True,
+    )
 
 def _build_launch_options(proxy: Optional[str], headless: bool) -> Dict[str, Any]:
     launch_options: Dict[str, Any] = {
@@ -609,7 +783,7 @@ def _run_browser_sentinel_capture(
     session_profile: Optional[SessionProfile] = None,
     flow_candidates: Optional[Sequence[str]] = None,
     fingerprint_scope: str = "auto_desktop",
-    fingerprint_engine: str = "internal",
+    fingerprint_engine: str = "browserforge",
 ) -> Dict[str, Any]:
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -628,40 +802,28 @@ def _run_browser_sentinel_capture(
     browser = None
     context = None
     page = None
+    proxy_lease = PlaywrightProxyLease(proxy)
 
     try:
+        proxy_lease.__enter__()
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(**_build_launch_options(proxy, headless))
+            browser = playwright.chromium.launch(
+                **apply_playwright_proxy(
+                    _build_launch_options(None, headless),
+                    proxy_lease,
+                )
+            )
             profile = _resolve_session_profile(
                 session_profile=session_profile,
                 user_agent=user_agent,
                 fingerprint_scope=fingerprint_scope,
             )
-            context_kwargs = _build_context_options(session_profile=profile)
-            fingerprint = context_kwargs.pop("_fingerprint", {})
-            requested_engine = str(fingerprint_engine or "internal").strip().lower()
-            engine_metadata: FingerprintEngineMetadata
-            if requested_engine in {"browserforge", "auto"}:
-                try:
-                    context = _new_browserforge_context(
-                        browser,
-                        fingerprint_scope=fingerprint_scope,
-                        session_profile=profile,
-                    )
-                except Exception as exc:
-                    context = None
-                    engine_metadata = resolve_fingerprint_engine(
-                        requested_engine,
-                        browserforge_available=False,
-                        fallback_reason=f"{type(exc).__name__}: {exc}",
-                    )
-                else:
-                    engine_metadata = resolve_fingerprint_engine(requested_engine, browserforge_available=True)
-            else:
-                engine_metadata = resolve_fingerprint_engine("internal", browserforge_available=False)
-            if context is None:
-                context = browser.new_context(**context_kwargs)
-                context.add_init_script(_build_fingerprint_init_script(fingerprint))
+            context, engine_metadata = _create_required_browser_context(
+                browser,
+                requested_engine=fingerprint_engine,
+                fingerprint_scope=fingerprint_scope,
+                session_profile=profile,
+            )
             page = context.new_page()
             try:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -922,6 +1084,7 @@ def _run_browser_sentinel_capture(
         _close_quietly(page)
         _close_quietly(context)
         _close_quietly(browser)
+        proxy_lease.close()
 
 
 def get_browser_sentinel_bundle_for_create_account(
@@ -934,7 +1097,7 @@ def get_browser_sentinel_bundle_for_create_account(
     session_profile: Optional[SessionProfile] = None,
     flow_candidates: Optional[Sequence[str]] = None,
     fingerprint_scope: str = "auto_desktop",
-    fingerprint_engine: str = "internal",
+    fingerprint_engine: str = "browserforge",
 ) -> Dict[str, Any]:
     return _run_browser_sentinel_capture(
         page_url=page_url,
@@ -959,7 +1122,7 @@ def get_browser_sentinel_token_for_create_account(
     session_profile: Optional[SessionProfile] = None,
     flow_candidates: Optional[Sequence[str]] = None,
     fingerprint_scope: str = "auto_desktop",
-    fingerprint_engine: str = "internal",
+    fingerprint_engine: str = "browserforge",
 ) -> Optional[str]:
     bundle = get_browser_sentinel_bundle_for_create_account(
         page_url=page_url,

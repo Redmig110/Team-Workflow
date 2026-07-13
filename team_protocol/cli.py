@@ -230,7 +230,7 @@ def command_web(args: argparse.Namespace) -> int:
 
 
 def _add_live_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--impersonate", default="chrome110")
+    parser.add_argument("--impersonate", default="chrome145")
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--proxy")
 
@@ -268,13 +268,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     push = subparsers.add_parser("push", help="idempotently upload a CPA JSON to management API")
     push.add_argument("--file", required=True)
-    push.add_argument("--base-url", default="https://upic.cloud")
+    push.add_argument("--base-url", default="https://management.example.com")
     push.add_argument("--management-key")
     push.add_argument("--remote-name")
     push.add_argument("--replace", action="store_true")
     push.add_argument("--dry-run", action="store_true")
     push.add_argument("--timeout", type=float, default=20.0)
-    push.add_argument("--impersonate", default="chrome110")
+    push.add_argument("--impersonate", default="chrome145")
     push.set_defaults(func=command_push)
 
     invite = subparsers.add_parser("invite", help="send a Team invite")

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
+from urllib.parse import urlencode
 
 from .cpa import OPENAI_AUTH_CLAIM, build_cpa, decode_jwt_payload
 
@@ -40,6 +41,7 @@ def build_sub2api_account(
     personal_access_token: str,
     concurrency: int = 10,
     priority: int = 1,
+    group_id: int | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     token = _clean_token(personal_access_token)
@@ -47,6 +49,8 @@ def build_sub2api_account(
         raise ValueError("personal access token is required for Sub2API")
     if concurrency < 0 or priority < 0:
         raise ValueError("Sub2API concurrency and priority must be non-negative")
+    if group_id is not None and int(group_id) <= 0:
+        raise ValueError("Sub2API group ID must be positive")
 
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     cpa = build_cpa(session, personal_access_token=token, now=now)
@@ -87,7 +91,7 @@ def build_sub2api_account(
             "last_refresh": exported_at,
         }
     )
-    return {
+    account = {
         "name": name,
         "platform": "openai",
         "type": "oauth",
@@ -97,6 +101,9 @@ def build_sub2api_account(
         "credentials": credentials,
         "extra": extra,
     }
+    if group_id is not None:
+        account["group_ids"] = [int(group_id)]
+    return account
 
 
 class Sub2APIClient:
@@ -107,7 +114,7 @@ class Sub2APIClient:
         password: str,
         *,
         timeout: float = 30.0,
-        impersonate: str = "chrome110",
+        impersonate: str = "chrome145",
         session: Any = None,
     ):
         self.base_url = str(base_url or "").strip().rstrip("/")
@@ -206,6 +213,28 @@ class Sub2APIClient:
         accounts = data.get("accounts") if isinstance(data, dict) else None
         return [dict(item) for item in (accounts or []) if isinstance(item, dict)]
 
+    def list_groups(
+        self,
+        *,
+        platform: str = "",
+        include_inactive: bool = False,
+    ) -> list[dict[str, Any]]:
+        query = urlencode(
+            {
+                key: value
+                for key, value in {
+                    "platform": str(platform or "").strip(),
+                    "include_inactive": "true" if include_inactive else "",
+                }.items()
+                if value
+            }
+        )
+        path = "/admin/groups/all" + (f"?{query}" if query else "")
+        data = self._request("GET", path)
+        if not isinstance(data, list):
+            raise Sub2APIError("Sub2API groups response is not a list")
+        return [dict(item) for item in data if isinstance(item, Mapping)]
+
     @staticmethod
     def _credentials(account: Mapping[str, Any]) -> Mapping[str, Any]:
         value = account.get("credentials")
@@ -231,12 +260,45 @@ class Sub2APIClient:
         right_token = _clean_token(str(cls._credentials(right).get("access_token") or ""))
         return bool(left_token and right_token and left_token == right_token)
 
+    @staticmethod
+    def _group_ids(account: Mapping[str, Any]) -> tuple[int, ...]:
+        values: set[int] = set()
+        raw_group_ids = account.get("group_ids")
+        if isinstance(raw_group_ids, (list, tuple, set)):
+            for value in raw_group_ids:
+                try:
+                    group_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if group_id > 0:
+                    values.add(group_id)
+        for key, id_key in (("account_groups", "group_id"), ("groups", "id")):
+            raw_groups = account.get(key)
+            if not isinstance(raw_groups, (list, tuple)):
+                continue
+            for item in raw_groups:
+                if not isinstance(item, Mapping):
+                    continue
+                try:
+                    group_id = int(item.get(id_key) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if group_id > 0:
+                    values.add(group_id)
+        return tuple(sorted(values))
+
+    @classmethod
+    def _groups_match(cls, remote: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+        expected_group_ids = set(cls._group_ids(expected))
+        return not expected_group_ids or expected_group_ids.issubset(cls._group_ids(remote))
+
     @classmethod
     def _create_payload(cls, account: Mapping[str, Any]) -> dict[str, Any]:
         credentials = dict(cls._credentials(account))
         token = _clean_token(str(credentials.pop("access_token", "") or ""))
         if not token:
             raise Sub2APIError("Sub2API account has no personal access token")
+        group_ids = list(cls._group_ids(account))
         payload = {
             "access_token": token,
             "name": str(account.get("name") or "").strip(),
@@ -245,8 +307,10 @@ class Sub2APIClient:
             "auto_pause_on_expired": bool(account.get("auto_pause_on_expired", True)),
             "credential_extras": credentials,
             "extra": dict(account.get("extra") or {}) if isinstance(account.get("extra"), Mapping) else {},
-            "skip_default_group_bind": False,
+            "skip_default_group_bind": bool(group_ids),
         }
+        if group_ids:
+            payload["group_ids"] = group_ids
         for key in ("expires_at", "rate_multiplier"):
             if account.get(key) is not None:
                 payload[key] = account[key]
@@ -261,7 +325,15 @@ class Sub2APIClient:
         account = dict(account)
         account_name = str(account.get("name") or "ChatGPT Account")
         remote_accounts = self.export_accounts()
-        if any(self._same_token(remote, account) for remote in remote_accounts):
+        matching_remote = next(
+            (remote for remote in remote_accounts if self._same_token(remote, account)),
+            None,
+        )
+        if matching_remote is not None:
+            if not self._groups_match(matching_remote, account):
+                raise Sub2APIError(
+                    f"Sub2API account exists outside the configured group: {account_name}"
+                )
             return Sub2APIPushResult(
                 action="skipped",
                 account_name=account_name,
@@ -285,9 +357,20 @@ class Sub2APIClient:
             "/admin/openai/create-from-codex-pat",
             json_data=self._create_payload(account),
         )
-        verified = any(self._same_token(remote, account) for remote in self.export_accounts())
-        if not verified:
+        matching_remote = next(
+            (
+                remote
+                for remote in self.export_accounts()
+                if self._same_token(remote, account)
+            ),
+            None,
+        )
+        if matching_remote is None:
             raise Sub2APIError(f"Sub2API post-create verification failed: {account_name}")
+        if not self._groups_match(matching_remote, account):
+            raise Sub2APIError(
+                f"Sub2API post-create group verification failed: {account_name}"
+            )
         return Sub2APIPushResult(
             action="created",
             account_name=account_name,

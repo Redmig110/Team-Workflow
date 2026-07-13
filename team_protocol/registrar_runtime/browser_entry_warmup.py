@@ -5,8 +5,9 @@ import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
-from .fingerprint_profiles import SessionProfile, context_options_for_profile, create_session_profile
-from .sentinel_browser import fingerprint_init_script_for_profile
+from ..playwright_proxy import PlaywrightProxyLease, apply_playwright_proxy
+from .fingerprint_profiles import SessionProfile, create_session_profile
+from .sentinel_browser import create_browserforge_context
 
 
 DEFAULT_BROWSER_ENTRY_TIMEOUT_SECONDS = 180
@@ -112,15 +113,25 @@ def _warmup_auth_entry_in_browser_sync(
     browser = None
     context = None
     page = None
+    proxy_lease = PlaywrightProxyLease(proxy)
 
     try:
+        proxy_lease.__enter__()
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(**_build_launch_options(proxy, headless))
+            browser = playwright.chromium.launch(
+                **apply_playwright_proxy(
+                    _build_launch_options(None, headless),
+                    proxy_lease,
+                )
+            )
             profile = session_profile or create_session_profile(user_agent=user_agent)
             if user_agent and user_agent.strip() != profile.user_agent:
                 raise ValueError("user_agent conflicts with the supplied SessionProfile")
-            context = browser.new_context(**context_options_for_profile(profile))
-            context.add_init_script(fingerprint_init_script_for_profile(profile))
+            context = create_browserforge_context(
+                browser,
+                fingerprint_scope=profile.scope,
+                session_profile=profile,
+            )
             normalized_cookies = _normalize_cookies(cookies)
             if normalized_cookies:
                 context.add_cookies(normalized_cookies)
@@ -184,6 +195,7 @@ def _warmup_auth_entry_in_browser_sync(
         _close_quietly(page)
         _close_quietly(context)
         _close_quietly(browser)
+        proxy_lease.close()
 
 
 def warmup_auth_entry_in_browser(

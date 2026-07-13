@@ -17,7 +17,7 @@ import queue
 import tempfile
 from http.cookies import SimpleCookie
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
+from .chromium_time import chromium_local_timestamp
 from urllib.parse import urlparse, parse_qs, urlencode, quote
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Callable
@@ -177,7 +177,7 @@ DEFAULT_BROWSER_SENTINEL_MAX_CONCURRENCY = 16
 MAX_BROWSER_SENTINEL_CONCURRENCY = 64
 DEFAULT_BROWSER_SENTINEL_FALLBACK_HEADED = False
 DEFAULT_BROWSER_SENTINEL_FINGERPRINT_SCOPE = "auto_desktop"
-DEFAULT_BROWSER_SENTINEL_FINGERPRINT_ENGINE = "internal"
+DEFAULT_BROWSER_SENTINEL_FINGERPRINT_ENGINE = "browserforge"
 _BROWSER_SENTINEL_SEMAPHORE_LOCK = threading.Lock()
 _BROWSER_SENTINEL_SEMAPHORES: Dict[int, threading.BoundedSemaphore] = {}
 
@@ -308,19 +308,7 @@ def _normalize_browser_sentinel_config(raw_config: Optional[Dict[str, Any]]) -> 
         max_concurrency = DEFAULT_BROWSER_SENTINEL_MAX_CONCURRENCY
     max_concurrency = max(1, min(max_concurrency, MAX_BROWSER_SENTINEL_CONCURRENCY))
     page_url = str(config.get("page_url") or DEFAULT_BROWSER_SENTINEL_PAGE_URL).strip() or DEFAULT_BROWSER_SENTINEL_PAGE_URL
-    fingerprint_engine = (
-        str(
-            config.get(
-                "fingerprint_engine",
-                config.get("browser_sentinel_fingerprint_engine", DEFAULT_BROWSER_SENTINEL_FINGERPRINT_ENGINE),
-            )
-            or DEFAULT_BROWSER_SENTINEL_FINGERPRINT_ENGINE
-        )
-        .strip()
-        .lower()
-    )
-    if fingerprint_engine not in {"internal", "browserforge", "auto"}:
-        fingerprint_engine = DEFAULT_BROWSER_SENTINEL_FINGERPRINT_ENGINE
+    fingerprint_engine = DEFAULT_BROWSER_SENTINEL_FINGERPRINT_ENGINE
     return {
         "enabled": _coerce_bool(config.get("enabled", False), default=False),
         "headless": _coerce_bool(config.get("headless", True), default=True),
@@ -448,30 +436,15 @@ def _resolve_session_profile(
     return session_profile
 
 
-_SENTINEL_TIMEZONE_NAMES = {
-    "America/New_York": ("Eastern Standard Time", "Eastern Daylight Time"),
-    "America/Chicago": ("Central Standard Time", "Central Daylight Time"),
-    "America/Denver": ("Mountain Standard Time", "Mountain Daylight Time"),
-    "America/Los_Angeles": ("Pacific Standard Time", "Pacific Daylight Time"),
-    "Europe/London": ("Greenwich Mean Time", "British Summer Time"),
-    "Europe/Berlin": (
-        "Central European Standard Time",
-        "Central European Summer Time",
-    ),
-}
-
-
-def _sentinel_local_timestamp(session_profile: SessionProfile) -> str:
-    local_now = datetime.now(ZoneInfo(session_profile.timezone_id))
-    names = _SENTINEL_TIMEZONE_NAMES.get(session_profile.timezone_id)
-    is_dst = bool(local_now.dst() and local_now.dst().total_seconds())
-    display_name = (
-        names[1 if is_dst else 0]
-        if names
-        else (local_now.tzname() or session_profile.timezone_id)
-    )
-    return local_now.strftime(
-        f"%a %b %d %Y %H:%M:%S GMT%z ({display_name})"
+def _sentinel_local_timestamp(
+    session_profile: SessionProfile,
+    *,
+    instant: Optional[datetime] = None,
+) -> str:
+    return chromium_local_timestamp(
+        locale=session_profile.locale,
+        timezone_id=session_profile.timezone_id,
+        instant=instant,
     )
 
 
@@ -935,7 +908,7 @@ def _copy_session_cookies(source_session: Any, target_session: Any) -> None:
 
 
 def _choose_tls_recovery_impersonate(current_impersonate: str) -> str:
-    return str(current_impersonate or "").strip().lower() or "chrome"
+    return str(current_impersonate or "").strip().lower() or "chrome145"
 
 
 def _call_with_http_fallback(
@@ -1080,7 +1053,7 @@ def _trace_via_pool_relay(pool_cfg: Dict[str, Any]) -> str:
                 requests.get,
                 relay_url,
                 params=params,
-                impersonate="chrome",
+                impersonate="chrome145",
                 timeout=timeout,
             )
             if resp.status_code == 200:
@@ -1225,7 +1198,7 @@ def _fetch_proxy_from_pool(pool_cfg: Dict[str, Any]) -> str:
         headers=headers or None,
         params=params or None,
         http_version=DEFAULT_HTTP_VERSION,
-        impersonate="chrome",
+        impersonate="chrome145",
         timeout=timeout,
     )
     if resp.status_code != 200:
@@ -1284,7 +1257,7 @@ def _mailtm_domains(proxies: Any = None) -> list[str]:
         headers=_mailtm_headers(),
         proxies=proxies,
         http_version=DEFAULT_HTTP_VERSION,
-        impersonate="chrome",
+        impersonate="chrome145",
         timeout=15,
     )
     if resp.status_code != 200:
@@ -1336,7 +1309,7 @@ def get_email_and_token(
                 json={"address": email, "password": password},
                 proxies=_resolve_request_proxies(proxies, proxy_selector),
                 http_version=DEFAULT_HTTP_VERSION,
-                impersonate="chrome",
+                impersonate="chrome145",
                 timeout=15,
             )
 
@@ -1350,7 +1323,7 @@ def get_email_and_token(
                 json={"address": email, "password": password},
                 proxies=_resolve_request_proxies(proxies, proxy_selector),
                 http_version=DEFAULT_HTTP_VERSION,
-                impersonate="chrome",
+                impersonate="chrome145",
                 timeout=15,
             )
 
@@ -1421,7 +1394,7 @@ def get_oai_code(
                 headers=_mailtm_headers(token=token),
                 proxies=_resolve_request_proxies(proxies, proxy_selector),
                 http_version=DEFAULT_HTTP_VERSION,
-                impersonate="chrome",
+                impersonate="chrome145",
                 timeout=15,
             )
             if resp.status_code != 200:
@@ -1458,7 +1431,7 @@ def get_oai_code(
                     headers=_mailtm_headers(token=token),
                     proxies=_resolve_request_proxies(proxies, proxy_selector),
                     http_version=DEFAULT_HTTP_VERSION,
-                    impersonate="chrome",
+                    impersonate="chrome145",
                     timeout=15,
                 )
                 if read_resp.status_code != 200:
@@ -4093,12 +4066,15 @@ def login_existing_account_for_token(
         sen_ac = _build_sentinel_any(*AUTHORIZE_CONTINUE_SENTINEL_FLOWS)
         if not sen_ac:
             return _failure("Sentinel token (authorize_continue) 获取失败")
-        ac_headers = _oauth_headers("https://auth.openai.com/log-in")
+        ac_headers = _oauth_headers("https://auth.openai.com/log-in-or-create-account")
         ac_headers["openai-sentinel-token"] = sen_ac
         ac_resp = _session_post(
             "https://auth.openai.com/api/accounts/authorize/continue",
             headers=ac_headers,
-            json={"username": {"kind": "email", "value": email}, "screen_hint": "login"},
+            json={
+                "username": {"kind": "email", "value": email},
+                "screen_hint": "login_or_signup",
+            },
         )
         if ac_resp is None:
             return _failure("Sentinel token (authorize_continue) 获取失败")
@@ -4134,6 +4110,11 @@ def login_existing_account_for_token(
             ac_data = {}
         consent_url = _extract_post_create_url(ac_data, chatgpt_base)
         page_type = str((ac_data.get("page") or {}).get("type", "")).strip() if isinstance(ac_data, dict) else ""
+        next_path = str(urlparse(str(consent_url or "")).path or "").strip()
+        emitter.info(
+            f"authorize/continue next page={page_type or '<empty>'} path={next_path or '<empty>'}",
+            step="get_token",
+        )
         if _requires_phone_verification(ac_data, ac_resp.text, consent_url):
             return _retry_after_phone_gate("authorize_continue")
 

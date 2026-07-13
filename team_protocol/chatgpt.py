@@ -69,7 +69,7 @@ class ChatGPTClient:
     def __init__(
         self,
         *,
-        impersonate: str = "chrome110",
+        impersonate: str = "chrome145",
         timeout: float = 30.0,
         proxy: str | None = None,
         session_profile: Any = None,

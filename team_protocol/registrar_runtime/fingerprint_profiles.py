@@ -6,6 +6,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, Optional, get_args
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +23,7 @@ class HttpChromeVersion:
     edge_sec_ch_ua: str = ""
     edge_version_prefix: str = ""
     edge_patch_range: tuple[int, int] = (0, 0)
+    reduced_user_agent: bool = False
 
     def impersonate_for(self, *, mobile: bool = False, browser: str = "chrome") -> str:
         if browser == "edge":
@@ -89,6 +91,9 @@ class SessionProfile(Mapping[str, Any]):
     audio: Mapping[str, Any]
     extra_http_headers: Mapping[str, str]
     http_headers: Mapping[str, str]
+    geo_country_code: str = ""
+    geo_continent_code: str = ""
+    geo_source: str = ""
 
     def to_legacy_dict(self) -> Dict[str, Any]:
         return {
@@ -121,6 +126,9 @@ class SessionProfile(Mapping[str, Any]):
             "audio": _deep_thaw(self.audio),
             "extra_http_headers": dict(self.extra_http_headers),
             "http_headers": dict(self.http_headers),
+            "geo_country_code": self.geo_country_code,
+            "geo_continent_code": self.geo_continent_code,
+            "geo_source": self.geo_source,
         }
 
     def playwright_context_options(self) -> Dict[str, Any]:
@@ -150,6 +158,9 @@ class SessionProfile(Mapping[str, Any]):
 
     def __len__(self) -> int:
         return len(self.to_legacy_dict())
+
+
+ACTIVE_DESKTOP_CHROME_MAJOR = 145
 
 
 SUPPORTED_HTTP_CHROME_VERSIONS: dict[int, HttpChromeVersion] = {
@@ -226,6 +237,14 @@ SUPPORTED_HTTP_CHROME_VERSIONS: dict[int, HttpChromeVersion] = {
         (59, 175),
         sec_ch_ua='"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
     ),
+    145: HttpChromeVersion(
+        145,
+        "chrome145",
+        "145.0.7632",
+        (6, 6),
+        sec_ch_ua='"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+        reduced_user_agent=True,
+    ),
 }
 
 _CHROME_UA_RE = re.compile(r"Chrome/(\d+)(?:\.([0-9.]+))?", re.IGNORECASE)
@@ -239,9 +258,6 @@ PROFILE_SCOPE_OPTIONS = (
     "windows",
     "macos",
     "linux",
-    "edge",
-    "mobile",
-    "all",
 )
 
 
@@ -543,7 +559,10 @@ def normalize_profile_scope(scope: str | None) -> str:
         "win": "windows",
         "mac": "macos",
         "osx": "macos",
-        "android": "mobile",
+        "android": "auto_desktop",
+        "mobile": "auto_desktop",
+        "edge": "auto_desktop",
+        "all": "all_desktop",
     }
     value = aliases.get(value, value)
     if value not in PROFILE_SCOPE_OPTIONS:
@@ -650,6 +669,26 @@ def _available_version_specs(
     return specs
 
 
+def _new_profile_version_specs(
+    *,
+    mobile: bool = False,
+    browser: str = "chrome",
+) -> list[HttpChromeVersion]:
+    specs = _available_version_specs(
+        generated_only=True,
+        mobile=mobile,
+        browser=browser,
+    )
+    if not mobile and browser == "chrome":
+        active = [spec for spec in specs if spec.major == ACTIVE_DESKTOP_CHROME_MAJOR]
+        if not active:
+            raise ValueError(
+                f"curl-cffi does not expose required Chrome {ACTIVE_DESKTOP_CHROME_MAJOR}"
+            )
+        return active
+    return [max(specs, key=lambda spec: spec.major)]
+
+
 def _normalize_version_policy(value: str) -> str:
     policy = str(value or "strict").strip().lower()
     if policy not in {"strict", "nearest"}:
@@ -693,6 +732,12 @@ def _rewrite_user_agent_version(
     return rewritten
 
 
+def _public_chromium_version(spec: HttpChromeVersion, full_version: str) -> str:
+    if spec.reduced_user_agent:
+        return f"{spec.major}.0.0.0"
+    return full_version
+
+
 def _select_chrome_version(
     rng: random.Random,
     user_agent: str = "",
@@ -715,9 +760,14 @@ def _select_chrome_version(
             raise ValueError("Chrome and Edg major versions must match")
         spec = SUPPORTED_HTTP_CHROME_VERSIONS.get(requested_major)
         available = _available_http_impersonations()
+        allowed_new_specs = _new_profile_version_specs(
+            mobile=mobile,
+            browser=browser,
+        )
         if (
             spec is not None
             and spec.impersonate_for(mobile=mobile, browser=browser) in available
+            and any(candidate.major == spec.major for candidate in allowed_new_specs)
         ):
             chrome_tail = str(chrome_match.group(2) or "").strip()
             chromium_version = (
@@ -734,6 +784,17 @@ def _select_chrome_version(
                 )
             else:
                 browser_version = chromium_version
+            if spec.reduced_user_agent:
+                public_version = f"{requested_major}.0.0.0"
+                supplied_version = (
+                    f"{requested_major}.{chrome_tail}"
+                    if chrome_tail
+                    else str(requested_major)
+                )
+                if supplied_version != public_version:
+                    raise ValueError(
+                        f"Chrome {requested_major} User-Agent must use reduced version {public_version}"
+                    )
             return (
                 requested_major,
                 requested_major,
@@ -746,7 +807,7 @@ def _select_chrome_version(
         if policy == "strict":
             supported = sorted(
                 candidate.major
-                for candidate in _available_version_specs(
+                for candidate in _new_profile_version_specs(
                     mobile=mobile,
                     browser=browser,
                 )
@@ -756,7 +817,7 @@ def _select_chrome_version(
                 f"supported majors: {supported}"
             )
         spec = min(
-            _available_version_specs(mobile=mobile, browser=browser),
+            _new_profile_version_specs(mobile=mobile, browser=browser),
             key=lambda candidate: (abs(candidate.major - requested_major), -candidate.major),
         )
         chromium_version, browser_version = _version_pair_for_spec(
@@ -777,18 +838,12 @@ def _select_chrome_version(
             reason,
             _rewrite_user_agent_version(
                 supplied_user_agent,
-                chromium_version,
+                _public_chromium_version(spec, chromium_version),
                 browser_version,
             ),
         )
 
-    spec = rng.choice(
-        _available_version_specs(
-            generated_only=True,
-            mobile=mobile,
-            browser=browser,
-        )
-    )
+    spec = _new_profile_version_specs(mobile=mobile, browser=browser)[0]
     chromium_version, browser_version = _version_pair_for_spec(
         spec,
         rng,
@@ -836,9 +891,17 @@ def create_session_profile(
     user_agent: str = "",
     rng: Optional[random.Random] = None,
     version_policy: str = "strict",
+    geo_hint: Optional[Mapping[str, Any]] = None,
 ) -> SessionProfile:
     rng = rng or random.SystemRandom()
-    normalized_scope = normalize_profile_scope(scope)
+    supplied_user_agent = str(user_agent or "").strip()
+    if supplied_user_agent and (
+        _EDGE_UA_RE.search(supplied_user_agent) or "Android" in supplied_user_agent
+    ):
+        raise ValueError("new account fingerprints require desktop Chrome")
+    geo = dict(geo_hint) if isinstance(geo_hint, Mapping) else {}
+    geo_scope = str(geo.get("profile_scope") or "").strip()
+    normalized_scope = normalize_profile_scope(geo_scope or scope)
     template = _template_for_user_agent(user_agent, normalized_scope, rng) if user_agent else rng.choice(_templates_for_scope(normalized_scope))
     mobile = bool(template.get("mobile"))
     browser = _browser_from_user_agent(user_agent) if user_agent else str(template.get("browser") or "chrome")
@@ -850,6 +913,32 @@ def create_session_profile(
         browser=browser,
     )
     locale, accept_language, timezones = rng.choice(tuple(template["locales"]))
+    geo_locale = str(geo.get("locale") or "").strip()
+    if not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", geo_locale):
+        geo_locale = ""
+    geo_accept_language = str(geo.get("accept_language") or "").strip()
+    if (
+        not geo_accept_language
+        or len(geo_accept_language) > 128
+        or "\r" in geo_accept_language
+        or "\n" in geo_accept_language
+    ):
+        geo_accept_language = ""
+    geo_timezone = str(geo.get("timezone_id") or "").strip()
+    if geo_timezone:
+        try:
+            ZoneInfo(geo_timezone)
+        except (ValueError, ZoneInfoNotFoundError):
+            geo_timezone = ""
+    if geo_locale:
+        locale = geo_locale
+        accept_language = geo_accept_language or (
+            f"{locale},en;q=0.9"
+            if locale.lower().startswith("en-")
+            else f"{locale},{locale.split('-', 1)[0].lower()};q=0.9,en;q=0.8"
+        )
+    if geo_timezone:
+        timezones = (geo_timezone,)
     viewport = dict(rng.choice(tuple(template["viewports"])))
     hardware = dict(rng.choice(tuple(template["hardware"])))
     webgl = dict(rng.choice(tuple(template["webgl"])))
@@ -862,14 +951,16 @@ def create_session_profile(
             f"(KHTML, like Gecko) Chrome/{chromium_full} Safari/537.36 Edg/{browser_full}"
         )
     elif mobile:
+        public_chromium_version = _public_chromium_version(spec, chromium_full)
         ua = (
             f"Mozilla/5.0 ({template['ua_os']}) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{chromium_full} Mobile Safari/537.36"
+            f"(KHTML, like Gecko) Chrome/{public_chromium_version} Mobile Safari/537.36"
         )
     else:
+        public_chromium_version = _public_chromium_version(spec, chromium_full)
         ua = (
             f"Mozilla/5.0 ({template['ua_os']}) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{chromium_full} Safari/537.36"
+            f"(KHTML, like Gecko) Chrome/{public_chromium_version} Safari/537.36"
         )
 
     platform_version_factory = template.get("platform_version")
@@ -883,14 +974,37 @@ def create_session_profile(
         "sec-ch-ua-full-version": f'"{browser_full}"',
         "sec-ch-ua-platform-version": platform_version,
     }
+    language = locale.split("-", 1)[0].lower()
+    languages = [locale]
+    if language != locale.casefold():
+        languages.append(language)
+    if language != "en":
+        languages.append("en")
     navigator = {
         "platform": str(template["navigator_platform"]),
         "vendor": "Google Inc.",
-        "languages": [locale, "en"] if locale != "en" else ["en"],
+        "languages": languages,
         "hardware_concurrency": hardware["hardware_concurrency"],
         "device_memory": hardware["device_memory"],
         "max_touch_points": 5 if mobile else 0,
     }
+    localized_fonts = {
+        "ar": ("Arial", "Tahoma"),
+        "bn": ("Nirmala UI",),
+        "ja": ("Meiryo", "Yu Gothic"),
+        "ko": ("Malgun Gothic",),
+        "th": ("Leelawadee UI",),
+        "zh": ("Microsoft YaHei", "SimSun"),
+    }.get(language, ())
+    fonts = tuple(dict.fromkeys((*template["fonts"], *localized_fonts)))
+    country_code = str(geo.get("country_code") or "").strip().upper()
+    if len(country_code) != 2 or not country_code.isalpha():
+        country_code = ""
+    continent_code = str(geo.get("continent_code") or "").strip().upper()
+    if len(continent_code) != 2 or not continent_code.isalpha():
+        continent_code = ""
+    geo_source = str(geo.get("source") or "").strip()[:32]
+
     profile = SessionProfile(
         profile_id=f"{template['id']}:v{major}:{rng.getrandbits(64):016x}",
         scope=normalized_scope,
@@ -916,11 +1030,14 @@ def create_session_profile(
         reduced_motion="no-preference",
         navigator=_deep_freeze(navigator),
         webgl=_deep_freeze(webgl),
-        fonts=_deep_freeze({"enabled": True, "families": list(template["fonts"]), "noise": rng.choice((0.002, 0.003, 0.005))}),
+        fonts=_deep_freeze({"enabled": True, "families": list(fonts), "noise": rng.choice((0.002, 0.003, 0.005))}),
         canvas=_deep_freeze({"enabled": True, "noise": rng.choice((2, 3, 4))}),
         audio=_deep_freeze({"enabled": True, "noise": rng.choice((0.000002, 0.000003, 0.000004))}),
         extra_http_headers=_deep_freeze({"Accept-Language": accept_language, **sec_headers}),
         http_headers=_deep_freeze({"User-Agent": ua, "Accept-Language": accept_language, **sec_headers}),
+        geo_country_code=country_code,
+        geo_continent_code=continent_code,
+        geo_source=geo_source,
     )
     return profile.validate()
 
@@ -938,8 +1055,14 @@ def validate_session_profile(profile: SessionProfile) -> None:
             if chrome_tail
             else str(chrome_match.group(1))
         )
-        if chrome_full_version != profile.chromium_version:
-            problems.append("UA Chrome full version does not match Chromium version")
+        spec = SUPPORTED_HTTP_CHROME_VERSIONS.get(profile.major)
+        expected_public_version = (
+            _public_chromium_version(spec, profile.chromium_version)
+            if spec is not None
+            else profile.chromium_version
+        )
+        if chrome_full_version != expected_public_version:
+            problems.append("UA Chrome version does not match the public Chromium version")
     if profile.browser != "edge" and profile.version != profile.chromium_version:
         problems.append("Chrome profile has different browser and Chromium versions")
 

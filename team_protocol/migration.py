@@ -386,7 +386,9 @@ def decode_legacy_config(
         state_is_app_owned=state_is_app_owned,
         invite_settle_seconds=invite_settle_seconds,
         management=LegacyManagementSettings(
-            base_url=str(management.get("base_url") or "https://upic.cloud").strip(),
+            base_url=str(
+                management.get("base_url") or "https://management.example.com"
+            ).strip(),
             api_key=management_key,
             push=bool(management.get("push", True)),
             replace=bool(management.get("replace", False)),
@@ -394,7 +396,7 @@ def decode_legacy_config(
         ),
         sub2api=LegacySub2APISettings(
             base_url=str(
-                sub2api.get("base_url") or "https://sub2api.upic.cloud"
+                sub2api.get("base_url") or "https://sub2api.example.com"
             ).strip(),
             email=str(sub2api.get("email") or "").strip(),
             password=sub2api_password,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import secrets
 import socket
@@ -53,6 +54,7 @@ from .migration import (
     verify_backup,
 )
 from .secret_store import SecretStore, SecretStoreError
+from .sub2api import Sub2APIClient, Sub2APIError
 from .task_queue import TaskQueue, redact_value
 
 
@@ -74,6 +76,7 @@ _TEXT_SETTING_KEYS = frozenset(
         "sub2api_push",
         "sub2api_concurrency",
         "sub2api_priority",
+        "sub2api_group_id",
     }
 )
 _VISIBLE_TEXT_SETTING_KEYS = _TEXT_SETTING_KEYS | {
@@ -98,6 +101,107 @@ _SENSITIVE_RESPONSE_KEYS = frozenset(
     }
 )
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_INSTANCE_LOCK_FILENAME = "console.instance.lock"
+_INSTANCE_LOCK_SIZE = 4096
+
+
+class ConsoleAlreadyRunningError(RuntimeError):
+    def __init__(self, url: str = "") -> None:
+        self.url = str(url or "").strip()
+        super().__init__(
+            f"console is already running at {self.url}"
+            if self.url
+            else "console is already running"
+        )
+
+
+class _ConsoleInstanceLock:
+    """Hold one OS-level lock per application data directory."""
+
+    def __init__(self, app_dir: str | Path) -> None:
+        self.path = Path(app_dir).expanduser().resolve() / _INSTANCE_LOCK_FILENAME
+        self._handle: Any = None
+
+    @staticmethod
+    def _lock(handle: Any) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _unlock(handle: Any) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _read_owner_url(self) -> str:
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(1)
+                raw = handle.read(_INSTANCE_LOCK_SIZE - 1).split(b"\x00", 1)[0]
+            payload = json.loads(raw.decode("utf-8").strip() or "{}")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return ""
+        return str(payload.get("url") or "").strip() if isinstance(payload, dict) else ""
+
+    def acquire(self) -> None:
+        if self._handle is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        handle = os.fdopen(descriptor, "r+b")
+        try:
+            handle.seek(0, os.SEEK_END)
+            missing = _INSTANCE_LOCK_SIZE - handle.tell()
+            if missing > 0:
+                handle.write(b"\x00" * missing)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._lock(handle)
+        except OSError as exc:
+            handle.close()
+            raise ConsoleAlreadyRunningError(self._read_owner_url()) from exc
+        self._handle = handle
+        self.set_owner_url("")
+
+    def set_owner_url(self, url: str) -> None:
+        if self._handle is None:
+            raise RuntimeError("console instance lock is not held")
+        payload = json.dumps(
+            {"pid": os.getpid(), "url": str(url or "").strip()},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        capacity = _INSTANCE_LOCK_SIZE - 1
+        if len(payload) + 1 > capacity:
+            raise ValueError("console instance metadata is too large")
+        self._handle.seek(1)
+        self._handle.write(payload + b"\n")
+        self._handle.write(b"\x00" * (capacity - len(payload) - 1))
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+
+    def release(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        try:
+            self._unlock(handle)
+        finally:
+            handle.close()
 
 
 class StrictModel(BaseModel):
@@ -625,6 +729,50 @@ class WebConsoleController:
         }
         return {"values": values, "secrets": configured}
 
+    def list_sub2api_groups(self) -> dict[str, Any]:
+        base_url = str(
+            self.database.get_text_setting(
+                "sub2api_base_url", "https://sub2api.example.com"
+            )
+            or ""
+        ).strip()
+        email = str(self.database.get_text_setting("sub2api_email", "") or "").strip()
+        password_blob = self.database.get_secret_setting("sub2api_password")
+        password = "" if password_blob is None else password_blob.decode("utf-8")
+        if not base_url or not email or not password:
+            raise FieldInputError(
+                {"sub2api": "service URL, administrator email, and password are required"}
+            )
+
+        with Sub2APIClient(base_url, email, password) as client:
+            remote_groups = client.list_groups(include_inactive=True)
+        groups = []
+        for item in remote_groups:
+            try:
+                group_id = int(item.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            name = str(item.get("name") or "").strip()
+            if group_id <= 0 or not name:
+                continue
+            groups.append(
+                {
+                    "id": group_id,
+                    "name": name,
+                    "platform": str(item.get("platform") or "").strip(),
+                    "status": str(item.get("status") or "").strip(),
+                    "is_exclusive": bool(item.get("is_exclusive", False)),
+                }
+            )
+        groups.sort(
+            key=lambda item: (
+                item["platform"].casefold(),
+                item["name"].casefold(),
+                item["id"],
+            )
+        )
+        return {"groups": groups}
+
     def update_settings(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         values = dict(payload.get("values") or {})
         secret_updates = dict(payload.get("secrets") or {})
@@ -1089,6 +1237,10 @@ def create_app(
     async def get_settings():
         return await _call_controller(controller.get_settings)
 
+    @app.get("/api/sub2api/groups")
+    async def list_sub2api_groups():
+        return await _call_controller(controller.list_sub2api_groups)
+
     @app.put("/api/settings")
     async def update_settings(request: SettingsUpdateRequest):
         return await _call_controller(controller.update_settings, request.model_dump())
@@ -1172,6 +1324,11 @@ async def _call_controller(function, *args, **kwargs):
             status_code=503,
             detail={"code": getattr(exc, "code", "storage_unavailable"), "message": str(exc)},
         ) from exc
+    except Sub2APIError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "sub2api_error", "message": str(exc)},
+        ) from exc
     except DatabaseError as exc:
         raise HTTPException(
             status_code=500,
@@ -1235,35 +1392,54 @@ def serve_web_console(
     app_dir: str | Path | None = None,
     legacy_config_path: str | Path | None = None,
 ) -> int:
-    selected_port = _available_port(port)
-    internal_legacy_path = (
-        Path(legacy_config_path).expanduser().resolve()
-        if legacy_config_path is not None
-        else (Path.cwd() / "workflow.example.json").resolve()
+    resolved_app_dir = (
+        Path(app_dir).expanduser().resolve()
+        if app_dir is not None
+        else default_app_dir().expanduser().resolve()
     )
-    controller = WebConsoleController(
-        app_dir=app_dir,
-        backup_dir=PROJECT_DIR / "backups",
-        legacy_config_path=internal_legacy_path,
-        inventory_expected_count=7_211,
-    )
-    app = create_app(controller)
-    url = f"http://127.0.0.1:{selected_port}"
-    if open_browser:
-        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    print(f"Team Workflow Console: {url}")
-    server = uvicorn.Server(
-        uvicorn.Config(
-            app,
-            host="127.0.0.1",
-            port=selected_port,
-            workers=1,
-            log_level="warning",
-            access_log=False,
+    instance_lock = _ConsoleInstanceLock(resolved_app_dir)
+    try:
+        instance_lock.acquire()
+    except ConsoleAlreadyRunningError as exc:
+        location = exc.url or str(resolved_app_dir)
+        print(f"Team Workflow Console already running: {location}")
+        if open_browser and exc.url:
+            webbrowser.open(exc.url)
+        return 0
+
+    try:
+        selected_port = _available_port(port)
+        internal_legacy_path = (
+            Path(legacy_config_path).expanduser().resolve()
+            if legacy_config_path is not None
+            else (Path.cwd() / "workflow.example.json").resolve()
         )
-    )
-    server.run()
-    return 0
+        controller = WebConsoleController(
+            app_dir=resolved_app_dir,
+            backup_dir=PROJECT_DIR / "backups",
+            legacy_config_path=internal_legacy_path,
+            inventory_expected_count=7_211,
+        )
+        app = create_app(controller)
+        url = f"http://127.0.0.1:{selected_port}"
+        instance_lock.set_owner_url(url)
+        if open_browser:
+            threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+        print(f"Team Workflow Console: {url}")
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host="127.0.0.1",
+                port=selected_port,
+                workers=1,
+                log_level="warning",
+                access_log=False,
+            )
+        )
+        server.run()
+        return 0
+    finally:
+        instance_lock.release()
 
 
 def main() -> int:

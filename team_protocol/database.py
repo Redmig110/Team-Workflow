@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ACCOUNT_STATUSES = frozenset(
     {
         "available",
@@ -38,15 +38,26 @@ MAILBOX_ALLOCATION_STATES = frozenset({"allocated", "retired", "disabled"})
 IDENTITY_FAILURE_CODES = frozenset({"alias_disabled", "mailbox_credentials_invalid"})
 WORKFLOW_STEPS = (
     "old_login",
+    "new_login",
     "invite",
     "old_leave",
-    "new_login",
     "pat",
     "cpa",
     "push",
     "push_sub2api",
 )
 _UNSET = object()
+_ACCOUNT_RUNTIME_IDENTITY_VERSION = 1
+_ACCOUNT_RUNTIME_IDENTITY_KEYS = frozenset(
+    {
+        "version",
+        "proxy_sid",
+        "proxy_geo",
+        "fingerprint_profile",
+        "browserforge_fingerprint",
+        "toolchain",
+    }
+)
 
 
 class SecretStoreLike(Protocol):
@@ -176,6 +187,36 @@ def _json_bytes(value: Mapping[str, Any]) -> bytes:
     return json.dumps(
         dict(value), ensure_ascii=False, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")
+
+
+def _validate_account_runtime_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise DatabaseError("account runtime identity is invalid")
+    identity = dict(value)
+    if set(identity) - _ACCOUNT_RUNTIME_IDENTITY_KEYS:
+        raise DatabaseError("account runtime identity contains unsupported fields")
+    if int(identity.get("version") or 0) != _ACCOUNT_RUNTIME_IDENTITY_VERSION:
+        raise DatabaseError("account runtime identity version is unsupported")
+    sid = str(identity.get("proxy_sid") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9]{8,32}", sid):
+        raise DatabaseError("account runtime identity has an invalid proxy SID")
+    identity["proxy_sid"] = sid
+    for key in (
+        "proxy_geo",
+        "fingerprint_profile",
+        "browserforge_fingerprint",
+        "toolchain",
+    ):
+        item = identity.get(key)
+        if item is not None and not isinstance(item, Mapping):
+            raise DatabaseError(f"account runtime identity {key} is invalid")
+        if isinstance(item, Mapping):
+            identity[key] = dict(item)
+    try:
+        _json_bytes(identity)
+    except (TypeError, ValueError) as exc:
+        raise DatabaseError("account runtime identity is not JSON serializable") from exc
+    return identity
 
 
 _SCHEMA_STATEMENTS = (
@@ -352,9 +393,14 @@ _SCHEMA_V2_STATEMENTS = (
     "CREATE UNIQUE INDEX ux_mailbox_alias_account ON mailbox_alias_allocations(account_id) WHERE account_id IS NOT NULL",
 )
 
+_SCHEMA_V3_STATEMENTS = (
+    "ALTER TABLE accounts ADD COLUMN runtime_identity_blob BLOB",
+)
+
 _SCHEMA_MIGRATIONS = {
     1: _SCHEMA_STATEMENTS,
     2: _SCHEMA_V2_STATEMENTS,
+    3: _SCHEMA_V3_STATEMENTS,
 }
 
 
@@ -1618,6 +1664,121 @@ class Database:
             )
             if cursor.rowcount != 1:
                 raise NotFoundError("account not found")
+
+    def _decode_account_network_identity(
+        self,
+        account_id: str,
+        blob: Any,
+    ) -> dict[str, Any]:
+        if blob is None:
+            return {}
+        try:
+            plaintext = self._require_secret_store().decrypt(
+                bytes(blob),
+                f"account:{account_id}:runtime-identity:v1",
+            )
+            value = json.loads(plaintext.decode("utf-8"))
+        except Exception as exc:
+            raise DatabaseError("account runtime identity is invalid") from exc
+        return _validate_account_runtime_identity(value)
+
+    def get_account_network_identity(self, account_id: str) -> dict[str, Any]:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT runtime_identity_blob FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("account not found")
+        return self._decode_account_network_identity(
+            account_id,
+            row["runtime_identity_blob"],
+        )
+
+    def ensure_account_network_identity(
+        self,
+        account_id: str,
+        *,
+        proxy_sid: str,
+    ) -> dict[str, Any]:
+        candidate = _validate_account_runtime_identity(
+            {
+                "version": _ACCOUNT_RUNTIME_IDENTITY_VERSION,
+                "proxy_sid": proxy_sid,
+            }
+        )
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT runtime_identity_blob FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("account not found")
+            existing = self._decode_account_network_identity(
+                account_id,
+                row["runtime_identity_blob"],
+            )
+            if existing:
+                return existing
+            ciphertext = self._require_secret_store().encrypt(
+                _json_bytes(candidate),
+                f"account:{account_id}:runtime-identity:v1",
+            )
+            connection.execute(
+                """
+                UPDATE accounts
+                SET runtime_identity_blob = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (sqlite3.Binary(ciphertext), _now(), account_id),
+            )
+            return candidate
+
+    def merge_account_network_identity(
+        self,
+        account_id: str,
+        updates: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(updates, Mapping):
+            raise ValidationError("account runtime identity update is invalid")
+        update_values = dict(updates)
+        if set(update_values) - _ACCOUNT_RUNTIME_IDENTITY_KEYS:
+            raise ValidationError("account runtime identity update contains unsupported fields")
+        update_values.pop("version", None)
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT runtime_identity_blob FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("account not found")
+            identity = self._decode_account_network_identity(
+                account_id,
+                row["runtime_identity_blob"],
+            )
+            if not identity:
+                raise StateConflictError("account runtime identity has not been initialized")
+            for key, value in update_values.items():
+                existing = identity.get(key, _UNSET)
+                if existing is not _UNSET and existing != value:
+                    raise StateConflictError(
+                        f"account runtime identity {key} is immutable"
+                    )
+                identity[key] = value
+            validated = _validate_account_runtime_identity(identity)
+            ciphertext = self._require_secret_store().encrypt(
+                _json_bytes(validated),
+                f"account:{account_id}:runtime-identity:v1",
+            )
+            connection.execute(
+                """
+                UPDATE accounts
+                SET runtime_identity_blob = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (sqlite3.Binary(ciphertext), _now(), account_id),
+            )
+            return validated
 
     def transition_account_status(self, account_id: str, new_status: str) -> dict[str, Any]:
         if new_status not in {"available", "disabled", "retired"}:
@@ -3410,9 +3571,12 @@ class Database:
                         self._require_secret_store().decrypt(
                             bytes(row["value_blob"]), f"setting:{row['key']}"
                         )
-                    for row in connection.execute(
-                        "SELECT id, credential_blob FROM accounts"
-                    ):
+                    account_query = (
+                        "SELECT id, credential_blob, runtime_identity_blob FROM accounts"
+                        if schema_version >= 3
+                        else "SELECT id, credential_blob, NULL AS runtime_identity_blob FROM accounts"
+                    )
+                    for row in connection.execute(account_query):
                         plaintext = self._require_secret_store().decrypt(
                             bytes(row["credential_blob"]),
                             f"account:{row['id']}:credentials",
@@ -3420,6 +3584,14 @@ class Database:
                         if not isinstance(json.loads(plaintext.decode("utf-8")), dict):
                             raise RestoreValidationError(
                                 "restore candidate account credentials are invalid"
+                            )
+                        if schema_version >= 3 and row["runtime_identity_blob"] is not None:
+                            runtime_plaintext = self._require_secret_store().decrypt(
+                                bytes(row["runtime_identity_blob"]),
+                                f"account:{row['id']}:runtime-identity:v1",
+                            )
+                            _validate_account_runtime_identity(
+                                json.loads(runtime_plaintext.decode("utf-8"))
                             )
                     if schema_version >= 2:
                         for row in connection.execute(

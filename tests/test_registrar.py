@@ -11,7 +11,10 @@ from team_protocol.registrar import (
     RegistrarAdapter,
     RegistrarIdentityError,
     RegistrarProxyLease,
+    bind_proxy_sid,
+    generate_proxy_sid,
     primary_email_for_alias,
+    proxy_region_code,
 )
 from team_protocol.registrar_runtime.appleemail_provider import (
     AppleEmailHotmailProvider,
@@ -82,11 +85,62 @@ class RegistrarTests(unittest.TestCase):
             )
             self.assertEqual(lease.source, "workflow")
             self.assertNotIn("pass", lease.description)
+            self.assertNotIn("user", lease.description)
 
     def test_proxy_lease_uses_direct_connection_when_proxy_is_empty(self):
         with RegistrarProxyLease() as lease:
             self.assertIsNone(lease.proxy)
             self.assertEqual(lease.source, "direct")
+
+    def test_account_sid_rebind_preserves_proxy_region_ttl_and_password(self):
+        proxy = (
+            "socks5://tenant-region-BR-sid-oldSID12-t-60:"
+            "proxy-password@proxy.example:1000"
+        )
+
+        rebound = bind_proxy_sid(proxy, "NewSid90")
+
+        self.assertEqual(
+            rebound,
+            "socks5://tenant-region-BR-sid-NewSid90-t-60:"
+            "proxy-password@proxy.example:1000",
+        )
+        self.assertEqual(proxy_region_code(rebound), "BR")
+
+    def test_account_sid_placeholder_and_static_proxy_are_supported(self):
+        self.assertEqual(
+            bind_proxy_sid(
+                "socks5://tenant-{sid}:password@proxy.example:1000",
+                "Stable90",
+            ),
+            "socks5://tenant-Stable90:password@proxy.example:1000",
+        )
+        self.assertEqual(
+            bind_proxy_sid(
+                "http://tenant:password@proxy.example:9000",
+                "Stable90",
+            ),
+            "http://tenant:password@proxy.example:9000",
+        )
+        first = bind_proxy_sid(
+            "http://tenant-{rand}:password@proxy.example:9000/{rand16}",
+            "Stable90",
+            required=True,
+        )
+        second = bind_proxy_sid(
+            "http://tenant-{rand}:password@proxy.example:9000/{rand16}",
+            "Stable90",
+            required=True,
+        )
+        self.assertEqual(first, second)
+        self.assertNotIn("{rand", first)
+
+    def test_generated_account_sid_is_provider_compatible(self):
+        first = generate_proxy_sid()
+        second = generate_proxy_sid()
+
+        self.assertRegex(first, r"^[A-Za-z0-9]{8}$")
+        self.assertNotEqual(first, second)
 
     def test_adapter_loads_the_bundled_runtime(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -176,6 +230,113 @@ import team_protocol.cli
         )
 
         self.assertIs(captured["session_profile"], profile)
+
+    def test_login_does_not_select_workspace_after_authorization_advanced(self):
+        extractor_calls = []
+        session = SimpleNamespace(
+            cookies={"oai-did": "device-id"},
+            post=lambda *_args, **_kwargs: self.fail("unexpected workspace selection"),
+        )
+        adapter = RegistrarAdapter.__new__(RegistrarAdapter)
+        adapter.state_dir = Path(".").resolve()
+        adapter._provider_class = lambda **_kwargs: object()
+        adapter._event_emitter = lambda **_kwargs: SimpleNamespace()
+        adapter._mailbox_identity_error_class = MailboxCredentialsInvalidError
+
+        def original_extractor(**kwargs):
+            extractor_calls.append(kwargs)
+            return None
+
+        adapter._register_module = SimpleNamespace(
+            _try_extract_chatgpt_session_token=original_extractor,
+        )
+
+        def fake_login(**_kwargs):
+            def session_get(*_args, **_request_kwargs):
+                return session
+
+            adapter._register_module._try_extract_chatgpt_session_token(
+                continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                session_get=session_get,
+            )
+            return {"ok": True, "token_data": {"access_token": "token"}}
+
+        adapter._login = fake_login
+
+        adapter.login(
+            email="main+1@example.com",
+            account_password="",
+            mailbox=self._mailbox(),
+            workspace_id="workspace-id",
+            verbose=False,
+        )
+
+        self.assertEqual(len(extractor_calls), 1)
+        self.assertEqual(
+            extractor_calls[0]["continue_url"],
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+
+    def test_login_selects_workspace_during_workspace_authorization_step(self):
+        extractor_calls = []
+        workspace_requests = []
+
+        def post(url, **kwargs):
+            workspace_requests.append((url, kwargs))
+            return SimpleNamespace(
+                status_code=302,
+                text="",
+                headers={"Location": "/sign-in-with-chatgpt/codex/consent"},
+            )
+
+        session = SimpleNamespace(cookies={"oai-did": "device-id"}, post=post)
+        adapter = RegistrarAdapter.__new__(RegistrarAdapter)
+        adapter.state_dir = Path(".").resolve()
+        adapter._provider_class = lambda **_kwargs: object()
+        adapter._event_emitter = lambda **_kwargs: SimpleNamespace()
+        adapter._mailbox_identity_error_class = MailboxCredentialsInvalidError
+
+        def original_extractor(**kwargs):
+            extractor_calls.append(kwargs)
+            return None
+
+        adapter._register_module = SimpleNamespace(
+            _try_extract_chatgpt_session_token=original_extractor,
+        )
+
+        def fake_login(**_kwargs):
+            def session_get(*_args, **_request_kwargs):
+                return session
+
+            adapter._register_module._try_extract_chatgpt_session_token(
+                continue_url="https://auth.openai.com/workspace",
+                session_get=session_get,
+            )
+            return {"ok": True, "token_data": {"access_token": "token"}}
+
+        adapter._login = fake_login
+
+        adapter.login(
+            email="main+1@example.com",
+            account_password="",
+            mailbox=self._mailbox(),
+            proxy="http://proxy.example:9000",
+            workspace_id="workspace-id",
+            verbose=False,
+        )
+
+        self.assertEqual(len(workspace_requests), 1)
+        request_url, request_kwargs = workspace_requests[0]
+        self.assertEqual(
+            request_url,
+            "https://auth.openai.com/api/accounts/workspace/select",
+        )
+        self.assertEqual(request_kwargs["json"], {"workspace_id": "workspace-id"})
+        self.assertEqual(request_kwargs["headers"]["oai-device-id"], "device-id")
+        self.assertEqual(
+            extractor_calls[0]["continue_url"],
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
 
     def test_adapter_maps_only_structured_identity_failures(self):
         fatal_adapter = self._adapter_for_login(

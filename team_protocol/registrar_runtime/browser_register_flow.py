@@ -10,8 +10,9 @@ import uuid
 from typing import Any, Dict, Optional, Sequence
 from urllib.parse import quote as urllib_parse_quote
 
-from .fingerprint_profiles import SessionProfile, context_options_for_profile, create_session_profile
-from .sentinel_browser import fingerprint_init_script_for_profile
+from ..playwright_proxy import PlaywrightProxyLease, apply_playwright_proxy
+from .fingerprint_profiles import SessionProfile, create_session_profile
+from .sentinel_browser import create_browserforge_context
 
 
 CHATGPT_BASE = "https://chatgpt.com"
@@ -109,6 +110,7 @@ class PlaywrightBrowserFlow:
         self._context = None
         self._page = None
         self._sentinel_page = None
+        self._proxy_lease = None
 
     def _log(self, level: str, message: str, step: str = "browser_flow") -> None:
         emitter = self.emitter
@@ -135,11 +137,15 @@ class PlaywrightBrowserFlow:
         self._playwright_cm = sync_playwright()
         self._playwright = self._playwright_cm.start()
         launch_options: Dict[str, Any] = {"headless": _coerce_bool(self.config.get("headless", False), default=False)}
-        if self.proxy:
-            launch_options["proxy"] = {"server": self.proxy}
+        self._proxy_lease = PlaywrightProxyLease(self.proxy)
+        self._proxy_lease.__enter__()
+        launch_options = apply_playwright_proxy(launch_options, self._proxy_lease)
         self._browser = self._playwright.chromium.launch(**launch_options)
-        self._context = self._browser.new_context(**context_options_for_profile(self.session_profile))
-        self._context.add_init_script(fingerprint_init_script_for_profile(self.session_profile))
+        self._context = create_browserforge_context(
+            self._browser,
+            fingerprint_scope=self.session_profile.scope,
+            session_profile=self.session_profile,
+        )
         self._page = self._context.new_page()
 
     def close(self) -> None:
@@ -159,6 +165,9 @@ class PlaywrightBrowserFlow:
                 pass
         self._playwright_cm = None
         self._playwright = None
+        if self._proxy_lease is not None:
+            self._proxy_lease.close()
+        self._proxy_lease = None
 
     def _ensure_page_origin(self, origin: str):
         self.open()

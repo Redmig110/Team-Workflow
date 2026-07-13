@@ -1,6 +1,7 @@
-curl-cffi>=0.6
+curl-cffi==0.15.0
 requests[socks]>=2.31
 fastapi
 uvicorn
-playwright>=1.40
+playwright==1.58.0
+browserforge==1.2.4
 tzdata>=2025.2; platform_system == "Windows"

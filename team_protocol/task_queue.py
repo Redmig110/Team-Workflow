@@ -7,8 +7,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .database import Database, StateConflictError
-from .registrar import MailboxCredentials, RegistrarProxyLease
+from .registrar import (
+    MailboxCredentials,
+    bind_proxy_sid,
+    generate_proxy_sid,
+)
 from .workflow import (
+    AccountNetworkSpec,
     AccountSpec,
     WorkflowCancelled,
     WorkflowConfig,
@@ -304,7 +309,15 @@ class TaskQueue:
         secrets: tuple[str, ...] = ()
         try:
             checkpoint = DatabaseCheckpointStore(self.database, run_id)
-            config, old_mailbox, new_mailbox, proxy, secrets = self._build_run_inputs(run_id)
+            (
+                config,
+                old_mailbox,
+                new_mailbox,
+                proxy,
+                old_network,
+                new_network,
+                secrets,
+            ) = self._build_run_inputs(run_id)
             current_step: list[str | None] = [None]
 
             def on_log(message: str) -> None:
@@ -350,6 +363,8 @@ class TaskQueue:
                 old_mailbox=old_mailbox,
                 new_mailbox=new_mailbox,
                 expanded_proxy=proxy,
+                old_network=old_network,
+                new_network=new_network,
                 verbose=False,
                 stop_event=stop_event,
                 logger=on_log,
@@ -439,6 +454,8 @@ class TaskQueue:
         MailboxCredentials,
         MailboxCredentials,
         str,
+        AccountNetworkSpec,
+        AccountNetworkSpec,
         tuple[str, ...],
     ]:
         run = self.database.get_run(run_id)
@@ -466,9 +483,136 @@ class TaskQueue:
         proxy_template = self._secret_setting("proxy")
         proxy = self.database.get_run_proxy(run_id) if run["proxy_configured"] else None
         if proxy is None:
-            with RegistrarProxyLease(explicit_proxy=proxy_template) as lease:
-                proxy = lease.proxy or ""
+            proxy = str(proxy_template or "").strip()
             self.database.set_run_proxy(run_id, proxy)
+
+        old_identity = self.database.ensure_account_network_identity(
+            old_account["id"],
+            proxy_sid=generate_proxy_sid(),
+        )
+        new_identity = self.database.ensure_account_network_identity(
+            new_account["id"],
+            proxy_sid=generate_proxy_sid(),
+        )
+        if old_identity["proxy_sid"] == new_identity["proxy_sid"]:
+            raise StateConflictError("old and new accounts share the same proxy SID")
+        checkpoint = self.database.get_run_checkpoint(run_id) or {}
+        legacy_profile = checkpoint.get("_fingerprint_profile")
+        legacy_geo = checkpoint.get("_proxy_geo")
+        legacy_browserforge = checkpoint.get("_browserforge_fingerprint")
+        legacy_toolchain = checkpoint.get("_browser_toolchain")
+
+        def uses_legacy_identity(role: str, identity: Mapping[str, Any]) -> bool:
+            if isinstance(identity.get("fingerprint_profile"), Mapping):
+                return False
+            role_steps = (
+                {"old_login", "old_workspace", "invite", "old_leave"}
+                if role == "old"
+                else {"new_login", "new_workspace", "pat"}
+            )
+            return (
+                any(step in checkpoint for step in role_steps)
+                and isinstance(legacy_profile, Mapping)
+                and isinstance(legacy_geo, Mapping)
+            )
+
+        old_legacy = uses_legacy_identity("old", old_identity)
+        new_legacy = uses_legacy_identity("new", new_identity)
+        try:
+            old_proxy = bind_proxy_sid(
+                proxy,
+                str(old_identity["proxy_sid"]),
+                required=bool(proxy),
+            )
+            new_proxy = bind_proxy_sid(
+                proxy,
+                str(new_identity["proxy_sid"]),
+                required=bool(proxy),
+            )
+        except ValueError:
+            legacy_openai_steps = {
+                "old_login",
+                "old_workspace",
+                "new_login",
+                "new_workspace",
+                "invite",
+                "old_leave",
+                "pat",
+            }
+            if not any(step in checkpoint for step in legacy_openai_steps):
+                raise
+            old_proxy = proxy
+            new_proxy = proxy
+        if old_legacy:
+            old_proxy = proxy
+        if new_legacy:
+            new_proxy = proxy
+
+        def account_network(
+            account_id: str,
+            account_proxy: str,
+            identity: Mapping[str, Any],
+            *,
+            legacy_recovery: bool,
+        ) -> AccountNetworkSpec:
+            source = dict(identity)
+            if legacy_recovery:
+                source.update(
+                    {
+                        "proxy_geo": dict(legacy_geo),
+                        "fingerprint_profile": dict(legacy_profile),
+                    }
+                )
+                if isinstance(legacy_browserforge, Mapping):
+                    source["browserforge_fingerprint"] = dict(legacy_browserforge)
+                if isinstance(legacy_toolchain, Mapping):
+                    source["toolchain"] = dict(legacy_toolchain)
+            return AccountNetworkSpec(
+                proxy=account_proxy,
+                proxy_sid=str(source["proxy_sid"]),
+                proxy_geo=(
+                    dict(source["proxy_geo"])
+                    if isinstance(source.get("proxy_geo"), Mapping)
+                    else None
+                ),
+                fingerprint_profile=(
+                    dict(source["fingerprint_profile"])
+                    if isinstance(source.get("fingerprint_profile"), Mapping)
+                    else None
+                ),
+                browserforge_fingerprint=(
+                    dict(source["browserforge_fingerprint"])
+                    if isinstance(source.get("browserforge_fingerprint"), Mapping)
+                    else None
+                ),
+                toolchain=(
+                    dict(source["toolchain"])
+                    if isinstance(source.get("toolchain"), Mapping)
+                    else None
+                ),
+                persist_callback=(
+                    None
+                    if legacy_recovery
+                    else lambda updates: self.database.merge_account_network_identity(
+                        account_id,
+                        updates,
+                    )
+                ),
+                legacy_recovery=legacy_recovery,
+            )
+
+        old_network = account_network(
+            old_account["id"],
+            old_proxy,
+            old_identity,
+            legacy_recovery=old_legacy,
+        )
+        new_network = account_network(
+            new_account["id"],
+            new_proxy,
+            new_identity,
+            legacy_recovery=new_legacy,
+        )
 
         management_key = self._secret_setting("management_api_key")
         sub2api_password = self._secret_setting("sub2api_password")
@@ -488,7 +632,7 @@ class TaskQueue:
             pat_ttl=self._int_setting("pat_ttl", 5_184_000, minimum=60),
             output_dir=output_dir,
             management_base_url=self._text_setting(
-                "management_base_url", "https://upic.cloud"
+                "management_base_url", "https://management.example.com"
             ),
             management_key=management_key,
             push=self._bool_setting("management_push", False),
@@ -498,7 +642,7 @@ class TaskQueue:
                 "invite_settle_seconds", 2.0, minimum=0.0
             ),
             sub2api_base_url=self._text_setting(
-                "sub2api_base_url", "https://sub2api.upic.cloud"
+                "sub2api_base_url", "https://sub2api.example.com"
             ),
             sub2api_email=self._text_setting("sub2api_email", ""),
             sub2api_password=sub2api_password,
@@ -507,6 +651,9 @@ class TaskQueue:
                 "sub2api_concurrency", 10, minimum=0
             ),
             sub2api_priority=self._int_setting("sub2api_priority", 1, minimum=0),
+            sub2api_group_id=self._optional_int_setting(
+                "sub2api_group_id", minimum=1
+            ),
         )
         known_secrets = tuple(
             sorted(
@@ -517,6 +664,10 @@ class TaskQueue:
                         *new_credentials.values(),
                         proxy_template,
                         proxy,
+                        old_proxy,
+                        new_proxy,
+                        old_identity.get("proxy_sid"),
+                        new_identity.get("proxy_sid"),
                         management_key,
                         sub2api_password,
                     )
@@ -526,7 +677,15 @@ class TaskQueue:
                 reverse=True,
             )
         )
-        return config, old_mailbox, new_mailbox, proxy, known_secrets
+        return (
+            config,
+            old_mailbox,
+            new_mailbox,
+            proxy,
+            old_network,
+            new_network,
+            known_secrets,
+        )
 
     @staticmethod
     def _mailbox(
@@ -566,6 +725,18 @@ class TaskQueue:
         except ValueError as exc:
             raise StateConflictError(f"setting {key} is not an integer") from exc
         return max(minimum, value)
+
+    def _optional_int_setting(self, key: str, *, minimum: int) -> int | None:
+        raw = self._text_setting(key, "").strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise StateConflictError(f"setting {key} is not an integer") from exc
+        if value < minimum:
+            raise StateConflictError(f"setting {key} must be at least {minimum}")
+        return value
 
     def _float_setting(self, key: str, default: float, *, minimum: float) -> float:
         try:

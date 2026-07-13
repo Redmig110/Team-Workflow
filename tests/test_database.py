@@ -235,7 +235,7 @@ class DatabaseTests(unittest.TestCase):
         self.database.initialize()
         diagnostics = self.database.diagnostics()
 
-        self.assertEqual(diagnostics["schema_version"], 2)
+        self.assertEqual(diagnostics["schema_version"], 3)
         self.assertEqual(diagnostics["journal_mode"], "wal")
         self.assertTrue(diagnostics["foreign_keys"])
         self.assertEqual(diagnostics["busy_timeout_ms"], 5000)
@@ -286,6 +286,68 @@ class DatabaseTests(unittest.TestCase):
                 primary_email="person@example.com",
                 credentials={"password": "other"},
                 source="test",
+            )
+
+    def test_account_network_identity_is_encrypted_stable_and_write_once(self):
+        account = self.create_account("network")
+        first = self.database.ensure_account_network_identity(
+            account["id"],
+            proxy_sid="Account90",
+        )
+        second = self.database.ensure_account_network_identity(
+            account["id"],
+            proxy_sid="Ignored99",
+        )
+        geo = {
+            "resolved": True,
+            "country_code": "BR",
+            "timezone_id": "America/Sao_Paulo",
+            "locale": "pt-BR",
+        }
+        profile = {
+            "profile_id": "account-fingerprint-90",
+            "major": 145,
+            "timezone_id": "America/Sao_Paulo",
+        }
+
+        updated = self.database.merge_account_network_identity(
+            account["id"],
+            {"proxy_geo": geo, "fingerprint_profile": profile},
+        )
+        repeated = self.database.merge_account_network_identity(
+            account["id"],
+            {"proxy_geo": geo, "fingerprint_profile": profile},
+        )
+
+        self.assertEqual(first["proxy_sid"], "Account90")
+        self.assertEqual(second["proxy_sid"], "Account90")
+        self.assertEqual(updated, repeated)
+        self.assertEqual(updated["version"], 1)
+        self.assertEqual(updated["proxy_geo"], geo)
+        self.assertEqual(updated["fingerprint_profile"], profile)
+        self.assertEqual(
+            self.database.get_account_network_identity(account["id"]),
+            updated,
+        )
+        self.database.replace_account_credentials(
+            account["id"],
+            {"refresh_token": "replacement-refresh"},
+        )
+        self.assertEqual(
+            self.database.get_account_network_identity(account["id"]),
+            updated,
+        )
+        raw = b"".join(
+            path.read_bytes() for path in self.path.parent.glob("console.db*")
+            if path.is_file()
+        )
+        self.assertNotIn(b"Account90", raw)
+        self.assertNotIn(b"account-fingerprint-90", raw)
+
+        with self.assertRaises(StateConflictError):
+            self.database.merge_account_network_identity(
+                account["id"],
+                {"proxy_sid": "Different90"},
             )
 
     def test_account_manual_lifecycle_blocks_bound_accounts(self):
@@ -908,10 +970,10 @@ class DatabaseTests(unittest.TestCase):
             connection.close()
 
         upgraded = Database(legacy_path, secret_store=TestSecretStore())
-        self.assertEqual(upgraded.diagnostics()["schema_version"], 2)
+        self.assertEqual(upgraded.diagnostics()["schema_version"], 3)
         self.assertEqual(upgraded.get_meta("instance_id"), "legacy-instance")
         upgraded.initialize()
-        self.assertEqual(upgraded.diagnostics()["schema_version"], 2)
+        self.assertEqual(upgraded.diagnostics()["schema_version"], 3)
 
     def test_inventory_import_search_and_credentials_are_encrypted(self):
         records = [
@@ -1323,9 +1385,9 @@ class DatabaseTests(unittest.TestCase):
         restored = self.database.restore_verified_backup(candidate, validation)
 
         self.assertEqual(validation.schema_version, 1)
-        self.assertEqual(restored["schema_version"], 2)
+        self.assertEqual(restored["schema_version"], 3)
         self.assertEqual(self.database.get_meta("instance_id"), "snapshot-v1-instance")
-        self.assertEqual(self.database.diagnostics()["schema_version"], 2)
+        self.assertEqual(self.database.diagnostics()["schema_version"], 3)
 
 
 if __name__ == "__main__":
