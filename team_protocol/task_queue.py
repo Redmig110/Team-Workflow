@@ -616,6 +616,8 @@ class TaskQueue:
 
         management_key = self._secret_setting("management_api_key")
         sub2api_password = self._secret_setting("sub2api_password")
+        sub2api_api_key = self._secret_setting("sub2api_api_key")
+        sub2api_totp_secret = self._secret_setting("sub2api_totp_secret")
         output_dir = Path(self._text_setting("output_dir", "output")).expanduser().resolve()
         config = WorkflowConfig(
             old_account=AccountSpec(
@@ -646,6 +648,8 @@ class TaskQueue:
             ),
             sub2api_email=self._text_setting("sub2api_email", ""),
             sub2api_password=sub2api_password,
+            sub2api_api_key=sub2api_api_key,
+            sub2api_totp_secret=sub2api_totp_secret,
             sub2api_push=self._bool_setting("sub2api_push", False),
             sub2api_concurrency=self._int_setting(
                 "sub2api_concurrency", 10, minimum=0
@@ -670,6 +674,8 @@ class TaskQueue:
                         new_identity.get("proxy_sid"),
                         management_key,
                         sub2api_password,
+                        sub2api_api_key,
+                        sub2api_totp_secret,
                     )
                     if value
                 },

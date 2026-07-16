@@ -91,6 +91,8 @@ class LegacySub2APISettings:
     base_url: str
     email: str
     password: str = field(repr=False)
+    api_key: str = field(default="", repr=False)
+    totp_secret: str = field(default="", repr=False)
     push: bool = False
     concurrency: int = 10
     priority: int = 1
@@ -370,6 +372,18 @@ def decode_legacy_config(
         sub2api.get("password") or environment.get("SUB2API_PASSWORD", ""),
         environment,
     )
+    sub2api_api_key = _env_expand(
+        sub2api.get("api_key")
+        or sub2api.get("admin_api_key")
+        or environment.get("SUB2API_API_KEY", ""),
+        environment,
+    )
+    sub2api_totp_secret = _env_expand(
+        sub2api.get("totp_secret")
+        or sub2api.get("totp_key")
+        or environment.get("SUB2API_TOTP_SECRET", ""),
+        environment,
+    )
     return LegacyConfig(
         config_path=resolved_config,
         mail_account_file=mail_account_file,
@@ -400,6 +414,8 @@ def decode_legacy_config(
             ).strip(),
             email=str(sub2api.get("email") or "").strip(),
             password=sub2api_password,
+            api_key=sub2api_api_key,
+            totp_secret=sub2api_totp_secret,
             push=bool(sub2api.get("push", False)),
             concurrency=concurrency,
             priority=priority,

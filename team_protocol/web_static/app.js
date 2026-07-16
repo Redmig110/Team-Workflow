@@ -1047,6 +1047,8 @@ function safeSettings(payload, previous = {}) {
     proxy_configured: configuredSecret(secrets, ["proxy", "proxy_configured", "proxy_present"], previous.proxy_configured),
     management_api_key_configured: configuredSecret(secrets, ["management_api_key", "management_api_key_configured", "management_key_present"], previous.management_api_key_configured),
     sub2api_password_configured: configuredSecret(secrets, ["sub2api_password", "sub2api_password_configured", "sub2api_password_present"], previous.sub2api_password_configured),
+    sub2api_api_key_configured: configuredSecret(secrets, ["sub2api_api_key", "sub2api_api_key_configured", "sub2api_api_key_present"], previous.sub2api_api_key_configured),
+    sub2api_totp_secret_configured: configuredSecret(secrets, ["sub2api_totp_secret", "sub2api_totp_secret_configured", "sub2api_totp_secret_present"], previous.sub2api_totp_secret_configured),
     last_backup_path: safeString(firstValue(settings, ["last_backup_path", "backup_path"])),
     last_backup_at: firstValue(settings, ["last_backup_at"]),
   };
@@ -1109,6 +1111,8 @@ function renderSecretControls(form = byId("settings-form")) {
     ["proxy", "proxy-secret-state", "proxy_configured"],
     ["management_api_key", "management-secret-state", "management_api_key_configured"],
     ["sub2api_password", "sub2api-secret-state", "sub2api_password_configured"],
+    ["sub2api_api_key", "sub2api-api-key-secret-state", "sub2api_api_key_configured"],
+    ["sub2api_totp_secret", "sub2api-totp-secret-state", "sub2api_totp_secret_configured"],
   ];
   for (const [secret, statusId, configuredKey] of secretDefinitions) {
     const clearing = state.clearSecrets.has(secret);
@@ -1149,7 +1153,7 @@ function renderSettings({force = false} = {}) {
     if (control) control.checked = Boolean(values[name]);
   }
   renderSub2APIGroupOptions(form, values.sub2api_group_id);
-  for (const name of ["proxy", "management_api_key", "sub2api_password"]) {
+  for (const name of ["proxy", "management_api_key", "sub2api_password", "sub2api_api_key", "sub2api_totp_secret"]) {
     const control = form.elements.namedItem(name);
     if (control) control.value = "";
   }
@@ -2042,7 +2046,7 @@ function settingsPayload(form) {
   const sub2apiGroupId = safeString(data.get("sub2api_group_id")).trim();
   values.sub2api_group_id = sub2apiGroupId ? Number(sub2apiGroupId) : "";
   const secrets = {};
-  for (const secretName of ["proxy", "management_api_key", "sub2api_password"]) {
+  for (const secretName of ["proxy", "management_api_key", "sub2api_password", "sub2api_api_key", "sub2api_totp_secret"]) {
     const value = safeString(data.get(secretName));
     if (value && !state.clearSecrets.has(secretName)) secrets[secretName] = value;
   }
@@ -2183,7 +2187,7 @@ document.addEventListener("input", (event) => {
     state.filters.runSearch = target.value;
     renderRunTable();
   } else if (target.closest("#settings-form")) {
-    if (["proxy", "management_api_key", "sub2api_password"].includes(target.name) && target.value) {
+    if (["proxy", "management_api_key", "sub2api_password", "sub2api_api_key", "sub2api_totp_secret"].includes(target.name) && target.value) {
       state.clearSecrets.delete(target.name);
     }
     state.settingsDirty = true;

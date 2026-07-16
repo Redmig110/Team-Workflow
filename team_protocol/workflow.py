@@ -83,6 +83,8 @@ class WorkflowConfig:
     sub2api_base_url: str = "https://sub2api.example.com"
     sub2api_email: str = ""
     sub2api_password: str = ""
+    sub2api_api_key: str = ""
+    sub2api_totp_secret: str = ""
     sub2api_push: bool = False
     sub2api_concurrency: int = 10
     sub2api_priority: int = 1
@@ -759,8 +761,15 @@ class WorkflowRunner:
         if isinstance(cached, dict) and cached.get("verified"):
             self._log("[resume] push_sub2api")
             return cached
-        if not self.config.sub2api_email or not self.config.sub2api_password:
-            raise RuntimeError("Sub2API email and password are required when sub2api.push=true")
+        verified_session_auth = bool(
+            self.config.sub2api_email
+            and self.config.sub2api_password
+            and self.config.sub2api_totp_secret
+        )
+        if not verified_session_auth:
+            raise RuntimeError(
+                "Sub2API push requires administrator email, password, and TOTP secret"
+            )
         token = str(pat.get("access_token") or "").strip()
         account = build_sub2api_account(
             new_session,
@@ -770,10 +779,16 @@ class WorkflowRunner:
             group_id=self.config.sub2api_group_id,
         )
         owns_client = self.sub2api is None
+        client_options = {}
+        if self.config.sub2api_api_key:
+            client_options["api_key"] = self.config.sub2api_api_key
+        if self.config.sub2api_totp_secret:
+            client_options["totp_secret"] = self.config.sub2api_totp_secret
         client = self.sub2api or Sub2APIClient(
             self.config.sub2api_base_url,
             self.config.sub2api_email,
             self.config.sub2api_password,
+            **client_options,
         )
         try:
             result = client.push_account(account)

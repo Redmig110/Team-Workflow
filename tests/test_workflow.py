@@ -277,6 +277,10 @@ def make_workflow_config(
     proxy="",
     push=True,
     sub2api_push=True,
+    sub2api_email="admin@example.com",
+    sub2api_password="secret",
+    sub2api_api_key="",
+    sub2api_totp_secret="totp-secret",
     invite_settle_seconds=0,
 ):
     return WorkflowConfig(
@@ -294,8 +298,10 @@ def make_workflow_config(
         remote_name="",
         invite_settle_seconds=invite_settle_seconds,
         sub2api_base_url="https://sub2api.example",
-        sub2api_email="admin@example.com",
-        sub2api_password="secret",
+        sub2api_email=sub2api_email,
+        sub2api_password=sub2api_password,
+        sub2api_api_key=sub2api_api_key,
+        sub2api_totp_secret=sub2api_totp_secret,
         sub2api_push=sub2api_push,
     )
 
@@ -662,6 +668,7 @@ class WorkflowTests(unittest.TestCase):
                 sub2api_base_url="https://sub2api.example",
                 sub2api_email="admin@example.com",
                 sub2api_password="secret",
+                sub2api_totp_secret="totp-secret",
                 sub2api_push=True,
                 sub2api_group_id=3,
             )
@@ -688,6 +695,11 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(result["invite"], "invited")
             self.assertEqual(result["old_leave"], "left")
             self.assertTrue(Path(result["cpa_path"]).exists())
+            cpa = json.loads(Path(result["cpa_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(cpa["access_token"], "at-test")
+            self.assertNotIn("session_token", cpa)
+            self.assertNotIn("expired", cpa)
+            self.assertNotIn("headers", cpa)
             self.assertEqual(result["push"]["action"], "uploaded")
             self.assertEqual(result["sub2api"]["action"], "created")
             self.assertEqual(len(sub2api.calls), 1)
@@ -770,6 +782,46 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertIsNone(result["push"])
         self.assertIsNone(result["sub2api"])
+
+    def test_sub2api_push_passes_totp_session_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_api_key="admin-key",
+                sub2api_totp_secret="totp-secret",
+            )
+            client = SimpleNamespace(
+                push_account=lambda _account: SimpleNamespace(
+                    action="created",
+                    account_name="main+3@example.com",
+                    verified=True,
+                    message="created",
+                ),
+                close=lambda: None,
+            )
+            with patch("team_protocol.workflow.Sub2APIClient", return_value=client) as client_class:
+                result = WorkflowRunner(
+                    config,
+                    **run_dependencies(config),
+                    registrar=FakeRegistrar(),
+                    chatgpt=FakeChatGPT(
+                        config.workspace_id,
+                        config.old_account.email,
+                        config.new_account.email,
+                    ),
+                    management=FakeManagement(),
+                    verbose=False,
+                ).run()
+
+        self.assertEqual(result["sub2api"]["action"], "created")
+        client_class.assert_called_once_with(
+            "https://sub2api.example",
+            "admin@example.com",
+            "secret",
+            api_key="admin-key",
+            totp_secret="totp-secret",
+        )
 
     def test_in_memory_checkpoint_prevents_duplicate_mutations_on_resume(self):
         with tempfile.TemporaryDirectory() as directory:

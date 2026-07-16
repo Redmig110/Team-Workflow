@@ -567,6 +567,8 @@ class TaskQueueTests(unittest.TestCase):
         self.database.set_text_setting("invite_settle_seconds", "4.5")
         self.database.set_text_setting("sub2api_group_id", "3")
         self.database.set_secret_setting("management_api_key", "management-secret")
+        self.database.set_secret_setting("sub2api_api_key", "sub2api-admin-key")
+        self.database.set_secret_setting("sub2api_totp_secret", "totp-secret")
         harness = RunnerHarness("success")
         queue = self.make_queue(harness)
         run = queue.enqueue([workspace["id"]])[0]
@@ -582,6 +584,8 @@ class TaskQueueTests(unittest.TestCase):
         self.assertEqual(call["config"].pat_ttl, 600)
         self.assertEqual(call["config"].invite_settle_seconds, 4.5)
         self.assertEqual(call["config"].management_key, "management-secret")
+        self.assertEqual(call["config"].sub2api_api_key, "sub2api-admin-key")
+        self.assertEqual(call["config"].sub2api_totp_secret, "totp-secret")
         self.assertFalse(call["config"].push)
         self.assertFalse(call["config"].sub2api_push)
         self.assertEqual(call["config"].sub2api_group_id, 3)

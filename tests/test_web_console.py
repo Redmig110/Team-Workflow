@@ -634,6 +634,8 @@ class WebConsoleTests(unittest.TestCase):
 
     def test_settings_empty_secret_preserves_and_explicit_clear_removes(self):
         self.database.set_secret_setting("sub2api_password", "secret-canary")
+        self.database.set_secret_setting("sub2api_api_key", "api-key-canary")
+        self.database.set_secret_setting("sub2api_totp_secret", "totp-canary")
         app = create_app(self.controller, testing=True)
         with TestClient(app) as client:
             preserved = client.put(
@@ -645,13 +647,23 @@ class WebConsoleTests(unittest.TestCase):
                         "sub2api_push": True,
                         "sub2api_group_id": 3,
                     },
-                    "secrets": {"sub2api_password": ""},
+                    "secrets": {
+                        "sub2api_password": "",
+                        "sub2api_api_key": "",
+                        "sub2api_totp_secret": "",
+                    },
                 },
             )
             cleared = client.put(
                 "/api/settings",
                 headers=self.origin_headers,
-                json={"clear_secrets": ["sub2api_password"]},
+                json={
+                    "clear_secrets": [
+                        "sub2api_password",
+                        "sub2api_api_key",
+                        "sub2api_totp_secret",
+                    ]
+                },
             )
             invalid = client.put(
                 "/api/settings",
@@ -660,9 +672,15 @@ class WebConsoleTests(unittest.TestCase):
             )
 
         self.assertTrue(preserved.json()["secrets"]["sub2api_password"])
+        self.assertTrue(preserved.json()["secrets"]["sub2api_api_key"])
+        self.assertTrue(preserved.json()["secrets"]["sub2api_totp_secret"])
         self.assertEqual(preserved.json()["values"]["sub2api_group_id"], "3")
         self.assertFalse(cleared.json()["secrets"]["sub2api_password"])
+        self.assertFalse(cleared.json()["secrets"]["sub2api_api_key"])
+        self.assertFalse(cleared.json()["secrets"]["sub2api_totp_secret"])
         self.assertNotIn("secret-canary", preserved.text + cleared.text)
+        self.assertNotIn("api-key-canary", preserved.text + cleared.text)
+        self.assertNotIn("totp-canary", preserved.text + cleared.text)
         self.assertEqual(invalid.status_code, 422)
         self.assertIn("values", invalid.json()["detail"]["fields"])
 
@@ -670,6 +688,7 @@ class WebConsoleTests(unittest.TestCase):
         self.database.set_text_setting("sub2api_base_url", "https://sub2api.example")
         self.database.set_text_setting("sub2api_email", "admin@example.com")
         self.database.set_secret_setting("sub2api_password", "secret-canary")
+        self.database.set_secret_setting("sub2api_totp_secret", "totp-canary")
         app = create_app(self.controller, testing=True)
         with patch("team_protocol.web_console.Sub2APIClient") as client_class:
             client = client_class.return_value.__enter__.return_value
@@ -705,9 +724,31 @@ class WebConsoleTests(unittest.TestCase):
             },
         )
         client_class.assert_called_once_with(
-            "https://sub2api.example", "admin@example.com", "secret-canary"
+            "https://sub2api.example",
+            "admin@example.com",
+            "secret-canary",
+            totp_secret="totp-canary",
         )
         client.list_groups.assert_called_once_with(include_inactive=True)
+
+    def test_sub2api_groups_route_uses_saved_api_key_without_password(self):
+        self.database.set_text_setting("sub2api_base_url", "https://sub2api.example")
+        self.database.set_secret_setting("sub2api_api_key", "api-key-canary")
+        app = create_app(self.controller, testing=True)
+        with patch("team_protocol.web_console.Sub2APIClient") as client_class:
+            client = client_class.return_value.__enter__.return_value
+            client.list_groups.return_value = []
+            with TestClient(app) as test_client:
+                response = test_client.get(
+                    "/api/sub2api/groups",
+                    headers={"X-Workflow-Token": self.controller.request_token},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        client_class.assert_called_once_with(
+            "https://sub2api.example", "", "", api_key="api-key-canary"
+        )
+        self.assertNotIn("api-key-canary", response.text)
 
     def test_static_traversal_and_legacy_config_routes_are_absent(self):
         app = create_app(self.controller, testing=True)
@@ -734,6 +775,8 @@ class WebConsoleTests(unittest.TestCase):
         self.assertIn('id="account-page-summary"', index.text)
         self.assertIn('data-action="account-page-next"', index.text)
         self.assertIn('name="sub2api_group_id"', index.text)
+        self.assertIn('name="sub2api_api_key"', index.text)
+        self.assertIn('name="sub2api_totp_secret"', index.text)
         self.assertIn('<select name="sub2api_group_id">', index.text)
         self.assertIn('/api/sub2api/groups', script.text)
         self.assertIn("const ACCOUNT_PAGE_SIZE = 50", script.text)

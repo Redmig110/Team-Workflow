@@ -127,15 +127,14 @@ def build_cpa(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    access_token = _first_non_empty(
+    session_access_token = _first_non_empty(
         session.get("accessToken"),
         session.get("access_token"),
         (session.get("tokens") or {}).get("access_token") if isinstance(session.get("tokens"), dict) else None,
     )
-    if not isinstance(access_token, str) or not access_token:
-        raise ValueError("session does not contain accessToken/access_token")
-
-    access_payload = decode_jwt_payload(access_token)
+    access_payload = decode_jwt_payload(
+        session_access_token if isinstance(session_access_token, str) else None
+    )
     access_auth = _claim_dict(access_payload, OPENAI_AUTH_CLAIM)
     access_profile = _claim_dict(access_payload, OPENAI_PROFILE_CLAIM)
 
@@ -183,15 +182,18 @@ def build_cpa(
         access_auth.get("chatgpt_plan_type"),
         id_auth.get("chatgpt_plan_type"),
     )
-    session_token = _first_non_empty(session.get("sessionToken"), session.get("session_token"))
     refresh_token = _first_non_empty(session.get("refreshToken"), session.get("refresh_token"), "")
     expires_at = _jwt_expiry(access_payload) or _parse_datetime(
         _first_non_empty(session.get("expired"), session.get("expiresAt"), session.get("expires"))
     )
 
-    synthetic = not isinstance(input_id_token, str) or not input_id_token
+    synthetic = (
+        bool(session.get("id_token_synthetic"))
+        or not isinstance(input_id_token, str)
+        or not input_id_token
+    )
     id_token = input_id_token
-    if synthetic:
+    if not isinstance(id_token, str) or not id_token:
         id_token = build_synthetic_id_token(
             email=str(email) if email else None,
             account_id=account_id,
@@ -200,6 +202,16 @@ def build_cpa(
             expires_at=expires_at,
             now=now,
         )
+
+    cpa_access_token = str(personal_access_token or "").strip()
+    if cpa_access_token.lower().startswith("bearer "):
+        cpa_access_token = cpa_access_token[7:].strip()
+    if not cpa_access_token and isinstance(session_access_token, str):
+        candidate = session_access_token.strip()
+        if candidate.lower().startswith("bearer "):
+            candidate = candidate[7:].strip()
+        if candidate.lower().startswith("at-"):
+            cpa_access_token = candidate
 
     name = _first_non_empty(email, session.get("name"), "ChatGPT Account")
     result: dict[str, Any] = {
@@ -212,18 +224,10 @@ def build_cpa(
         "chatgpt_plan_type": plan_type,
         "id_token": id_token,
         "id_token_synthetic": True if synthetic else None,
-        "access_token": access_token,
+        "access_token": cpa_access_token or None,
         "refresh_token": str(refresh_token or ""),
-        "session_token": session_token,
         "last_refresh": _iso_utc(now, milliseconds=True),
-        "expired": _iso_utc(expires_at, milliseconds=False) if expires_at else None,
     }
-    if personal_access_token:
-        token = personal_access_token.strip()
-        if token.lower().startswith("bearer "):
-            token = token[7:].strip()
-        if token:
-            result["headers"] = {"authorization": f"Bearer {token}"}
 
     return {key: value for key, value in result.items() if value is not None}
 

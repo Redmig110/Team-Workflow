@@ -188,6 +188,8 @@ class DatabaseTests(unittest.TestCase):
                 base_url="https://sub2api.invalid",
                 email="admin@example.com",
                 password="sub2-secret",
+                api_key="sub2-api-key",
+                totp_secret="sub2-totp-secret",
                 push=True,
                 concurrency=30,
                 priority=2,
@@ -716,6 +718,11 @@ class DatabaseTests(unittest.TestCase):
             self.database.get_secret_setting("management_api_key"), b"management-secret"
         )
         self.assertEqual(self.database.get_secret_setting("sub2api_password"), b"sub2-secret")
+        self.assertEqual(self.database.get_secret_setting("sub2api_api_key"), b"sub2-api-key")
+        self.assertEqual(
+            self.database.get_secret_setting("sub2api_totp_secret"),
+            b"sub2-totp-secret",
+        )
         for secret in (
             "mailbox-secret-main",
             "client-secret-main",
@@ -725,6 +732,8 @@ class DatabaseTests(unittest.TestCase):
             "proxy-secret",
             "management-secret",
             "sub2-secret",
+            "sub2-api-key",
+            "sub2-totp-secret",
             "state-secret",
         ):
             self.assert_secret_absent_from_database_files(secret)
@@ -773,7 +782,13 @@ class DatabaseTests(unittest.TestCase):
         config = replace(
             model.config,
             management=replace(model.config.management, api_key="", push=True),
-            sub2api=replace(model.config.sub2api, password="", push=True),
+            sub2api=replace(
+                model.config.sub2api,
+                password="",
+                api_key="",
+                totp_secret="",
+                push=True,
+            ),
         )
 
         self.database.apply_legacy_import(replace(model, config=config))
@@ -782,6 +797,8 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.database.get_text_setting("sub2api_push"), "0")
         self.assertIsNone(self.database.get_secret_setting("management_api_key"))
         self.assertIsNone(self.database.get_secret_setting("sub2api_password"))
+        self.assertIsNone(self.database.get_secret_setting("sub2api_api_key"))
+        self.assertIsNone(self.database.get_secret_setting("sub2api_totp_secret"))
 
     def test_legacy_import_without_checkpoint_creates_ready_workspace(self):
         model = self.legacy_model(with_state=False)

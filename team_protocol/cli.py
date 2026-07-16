@@ -126,7 +126,7 @@ def command_convert(args: argparse.Namespace) -> int:
     print(f"Email: {payload.get('email')}")
     print(f"Account: {payload.get('account_id')}")
     print(f"Plan: {payload.get('plan_type')}")
-    print(f"PAT header: {'yes' if payload.get('headers') else 'no'}")
+    print(f"PAT access token: {'yes' if payload.get('access_token') else 'no'}")
     return 0
 
 
@@ -196,7 +196,9 @@ def command_create_token(args: argparse.Namespace) -> int:
     if args.update_cpa:
         if not token:
             raise ValueError("token creation response did not contain access_token")
-        data["headers"] = {"authorization": f"Bearer {token}"}
+        data["access_token"] = token
+        for legacy_key in ("session_token", "sessionToken", "expired", "headers"):
+            data.pop(legacy_key, None)
         _write_json(Path(args.update_cpa), data)
     print(json.dumps(safe_response, ensure_ascii=False, indent=2))
     return 0

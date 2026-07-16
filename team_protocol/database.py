@@ -3352,6 +3352,8 @@ class Database:
 
             management_secret = str(config.management.api_key or "")
             sub2api_secret = str(config.sub2api.password or "")
+            sub2api_api_key = str(config.sub2api.api_key or "")
+            sub2api_totp_secret = str(config.sub2api.totp_secret or "")
             text_settings = {
                 "output_dir": str(config.output_dir),
                 "invite_settle_seconds": config.invite_settle_seconds,
@@ -3367,6 +3369,7 @@ class Database:
                     config.sub2api.push
                     and bool(config.sub2api.email)
                     and bool(sub2api_secret)
+                    and bool(sub2api_totp_secret)
                 ),
                 "sub2api_concurrency": config.sub2api.concurrency,
                 "sub2api_priority": config.sub2api.priority,
@@ -3377,6 +3380,8 @@ class Database:
                 "proxy": str(config.proxy or ""),
                 "management_api_key": management_secret,
                 "sub2api_password": sub2api_secret,
+                "sub2api_api_key": sub2api_api_key,
+                "sub2api_totp_secret": sub2api_totp_secret,
             }
             for key, value in secret_settings.items():
                 if value:

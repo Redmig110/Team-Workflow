@@ -100,6 +100,8 @@ class MigrationFixture:
                 "base_url": "https://sub2api.invalid",
                 "email": "admin@example.com",
                 "password": "%SUB2_PASSWORD%",
+                "api_key": "%SUB2_API_KEY%",
+                "totp_secret": "%SUB2_TOTP_SECRET%",
                 "push": True,
                 "concurrency": 30,
                 "priority": 2,
@@ -134,7 +136,12 @@ class MigrationFixture:
     def model(self):
         discovery = discover_legacy(
             self.config_path,
-            env={"CPA_KEY": "management-secret", "SUB2_PASSWORD": "sub2-secret"},
+            env={
+                "CPA_KEY": "management-secret",
+                "SUB2_PASSWORD": "sub2-secret",
+                "SUB2_API_KEY": "sub2-api-key",
+                "SUB2_TOTP_SECRET": "sub2-totp-secret",
+            },
         )
         return discovery, validate_legacy(discovery)
 
@@ -205,6 +212,8 @@ class MigrationParsingTests(unittest.TestCase):
         self.assertFalse(model.config.management.push)
         self.assertTrue(model.config.management.replace)
         self.assertEqual(model.config.sub2api.password, "sub2-secret")
+        self.assertEqual(model.config.sub2api.api_key, "sub2-api-key")
+        self.assertEqual(model.config.sub2api.totp_secret, "sub2-totp-secret")
         self.assertTrue(model.config.sub2api.push)
         self.assertEqual(model.config.sub2api.concurrency, 30)
         self.assertRegex(model.migration_id, r"^[0-9a-f]{64}$")

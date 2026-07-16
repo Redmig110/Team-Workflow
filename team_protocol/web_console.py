@@ -60,7 +60,15 @@ from .task_queue import TaskQueue, redact_value
 
 STATIC_DIR = Path(__file__).resolve().parent / "web_static"
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-_SECRET_SETTING_KEYS = frozenset({"proxy", "management_api_key", "sub2api_password"})
+_SECRET_SETTING_KEYS = frozenset(
+    {
+        "proxy",
+        "management_api_key",
+        "sub2api_password",
+        "sub2api_api_key",
+        "sub2api_totp_secret",
+    }
+)
 _TEXT_SETTING_KEYS = frozenset(
     {
         "output_dir",
@@ -97,6 +105,8 @@ _SENSITIVE_RESPONSE_KEYS = frozenset(
         "credential_purpose",
         "management_api_key",
         "sub2api_password",
+        "sub2api_api_key",
+        "sub2api_totp_secret",
         "proxy",
     }
 )
@@ -739,12 +749,26 @@ class WebConsoleController:
         email = str(self.database.get_text_setting("sub2api_email", "") or "").strip()
         password_blob = self.database.get_secret_setting("sub2api_password")
         password = "" if password_blob is None else password_blob.decode("utf-8")
-        if not base_url or not email or not password:
+        api_key_blob = self.database.get_secret_setting("sub2api_api_key")
+        api_key = "" if api_key_blob is None else api_key_blob.decode("utf-8")
+        totp_blob = self.database.get_secret_setting("sub2api_totp_secret")
+        totp_secret = "" if totp_blob is None else totp_blob.decode("utf-8")
+        if not base_url or (not api_key and (not email or not password)):
             raise FieldInputError(
-                {"sub2api": "service URL, administrator email, and password are required"}
+                {
+                    "sub2api": (
+                        "service URL and either administrator API key or "
+                        "administrator email and password are required"
+                    )
+                }
             )
 
-        with Sub2APIClient(base_url, email, password) as client:
+        client_options = {}
+        if api_key:
+            client_options["api_key"] = api_key
+        if totp_secret:
+            client_options["totp_secret"] = totp_secret
+        with Sub2APIClient(base_url, email, password, **client_options) as client:
             remote_groups = client.list_groups(include_inactive=True)
         groups = []
         for item in remote_groups:

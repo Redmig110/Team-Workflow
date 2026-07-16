@@ -2,13 +2,18 @@ import base64
 import json
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from team_protocol.cpa import OPENAI_AUTH_CLAIM, OPENAI_PROFILE_CLAIM
 from team_protocol.sub2api import (
     Sub2APIClient,
     Sub2APIError,
+    _totp_code,
     build_sub2api_account,
 )
+
+
+TOTP_TEST_SECRET = base64.b32encode(b"12345678901234567890").decode("ascii")
 
 
 def encode(value):
@@ -88,6 +93,115 @@ class Sub2APIAccountTests(unittest.TestCase):
         self.assertEqual(account["credentials"]["email"], "user@example.com")
         self.assertEqual(account["concurrency"], 10)
         self.assertEqual(account["priority"], 1)
+
+    def test_api_key_auth_skips_login_and_sets_admin_header(self):
+        session = QueueSession(
+            [wrapped([{"id": 3, "name": "K12", "platform": "openai"}])]
+        )
+        client = Sub2APIClient(
+            "https://sub2api.example",
+            "admin@example.com",
+            "secret",
+            api_key="admin-key",
+            session=session,
+        )
+
+        groups = client.list_groups(include_inactive=True)
+
+        self.assertEqual([group["id"] for group in groups], [3])
+        self.assertEqual(len(session.calls), 1)
+        headers = session.calls[0][2]["headers"]
+        self.assertEqual(headers["x-api-key"], "admin-key")
+        self.assertEqual(headers["X-Admin-UI-Request"], "1")
+        self.assertNotIn("Authorization", headers)
+
+    def test_totp_session_is_verified_and_preferred_over_api_key(self):
+        session = QueueSession(
+            [
+                wrapped(
+                    {
+                        "requires_2fa": True,
+                        "temp_token": "temporary-token",
+                        "user_email_masked": "a***@example.com",
+                    }
+                ),
+                wrapped({"access_token": "verified-admin-token"}),
+                wrapped([{"id": 3, "name": "K12", "platform": "openai"}]),
+            ]
+        )
+        client = Sub2APIClient(
+            "https://sub2api.example",
+            "admin@example.com",
+            "secret",
+            api_key="admin-key",
+            totp_secret=TOTP_TEST_SECRET,
+            session=session,
+        )
+
+        with patch("team_protocol.sub2api.time.time", return_value=59):
+            groups = client.list_groups(include_inactive=True)
+
+        self.assertEqual([group["id"] for group in groups], [3])
+        self.assertTrue(session.calls[0][1].endswith("/auth/login"))
+        self.assertTrue(session.calls[1][1].endswith("/auth/login/2fa"))
+        self.assertEqual(
+            session.calls[1][2]["json"],
+            {"temp_token": "temporary-token", "totp_code": "287082"},
+        )
+        headers = session.calls[2][2]["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer verified-admin-token")
+        self.assertNotIn("x-api-key", headers)
+
+    def test_totp_code_accepts_otpauth_uri(self):
+        uri = (
+            "otpauth://totp/Sub2API:admin@example.com?"
+            f"secret={TOTP_TEST_SECRET}&issuer=Sub2API"
+        )
+
+        self.assertEqual(_totp_code(uri, at=59), "287082")
+
+    def test_push_performs_totp_step_up_before_protected_create(self):
+        account = account_payload()
+        session = QueueSession(
+            [
+                wrapped({"requires_2fa": True, "temp_token": "temporary-token"}),
+                wrapped({"access_token": "verified-admin-token"}),
+                wrapped({"verified": True}),
+                wrapped({"exported_at": "2026-07-12T09:00:00Z", "accounts": []}),
+                wrapped({"id": 42, "name": account["name"]}),
+                wrapped(
+                    {
+                        "exported_at": "2026-07-12T09:00:01Z",
+                        "accounts": [account],
+                    }
+                ),
+            ]
+        )
+        client = Sub2APIClient(
+            "https://sub2api.example",
+            "admin@example.com",
+            "secret",
+            totp_secret=TOTP_TEST_SECRET,
+            session=session,
+        )
+
+        with patch("team_protocol.sub2api.time.time", return_value=59):
+            result = client.push_account(account)
+
+        self.assertTrue(result.verified)
+        self.assertTrue(session.calls[2][1].endswith("/user/totp/step-up"))
+        self.assertEqual(session.calls[2][2]["json"], {"code": "287082"})
+        self.assertEqual(
+            session.calls[2][2]["headers"]["X-User-UI-Request"],
+            "1",
+        )
+        self.assertTrue(
+            session.calls[4][1].endswith("/admin/openai/create-from-codex-pat")
+        )
+        self.assertEqual(
+            session.calls[4][2]["headers"]["X-Admin-UI-Request"],
+            "1",
+        )
 
     def test_push_creates_and_verifies_new_account(self):
         account = account_payload()

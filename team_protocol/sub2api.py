@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
+import struct
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from .cpa import OPENAI_AUTH_CLAIM, build_cpa, decode_jwt_payload
 
@@ -25,6 +31,26 @@ def _clean_token(value: str) -> str:
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
     return token
+
+
+def _totp_code(secret: str, *, at: float | None = None) -> str:
+    raw_secret = str(secret or "").strip()
+    if raw_secret.lower().startswith("otpauth://"):
+        values = parse_qs(urlparse(raw_secret).query).get("secret") or []
+        raw_secret = str(values[0] if values else "")
+    normalized = "".join(raw_secret.split()).replace("-", "").upper().rstrip("=")
+    if not normalized:
+        raise ValueError("TOTP secret is required")
+    padded = normalized + "=" * ((8 - len(normalized) % 8) % 8)
+    try:
+        key = base64.b32decode(padded, casefold=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("TOTP secret is not valid base32") from exc
+    counter = int((time.time() if at is None else at) // 30)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = int.from_bytes(digest[offset : offset + 4], "big") & 0x7FFFFFFF
+    return f"{value % 1_000_000:06d}"
 
 
 def _without_empty(values: Mapping[str, Any]) -> dict[str, Any]:
@@ -54,7 +80,16 @@ def build_sub2api_account(
 
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     cpa = build_cpa(session, personal_access_token=token, now=now)
-    access_payload = decode_jwt_payload(str(cpa.get("access_token") or ""))
+    nested_tokens = (
+        session.get("tokens") if isinstance(session.get("tokens"), dict) else {}
+    )
+    session_access_token = str(
+        session.get("accessToken")
+        or session.get("access_token")
+        or nested_tokens.get("access_token")
+        or ""
+    )
+    access_payload = decode_jwt_payload(session_access_token)
     auth_claim = access_payload.get(OPENAI_AUTH_CLAIM)
     auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
     email = str(cpa.get("email") or "").strip()
@@ -110,9 +145,11 @@ class Sub2APIClient:
     def __init__(
         self,
         base_url: str,
-        email: str,
-        password: str,
+        email: str = "",
+        password: str = "",
         *,
+        api_key: str = "",
+        totp_secret: str = "",
         timeout: float = 30.0,
         impersonate: str = "chrome145",
         session: Any = None,
@@ -120,12 +157,16 @@ class Sub2APIClient:
         self.base_url = str(base_url or "").strip().rstrip("/")
         self.email = str(email or "").strip()
         self.password = str(password or "")
+        self.api_key = str(api_key or "").strip()
+        self.totp_secret = str(totp_secret or "").strip()
         self.timeout = timeout
         self.impersonate = impersonate
         if not self.base_url.startswith(("http://", "https://")):
             raise ValueError("Sub2API base URL must start with http:// or https://")
-        if not self.email or not self.password:
-            raise ValueError("Sub2API email and password are required")
+        if not self.api_key and (not self.email or not self.password):
+            raise ValueError(
+                "Sub2API administrator API key or email and password are required"
+            )
         if session is None:
             try:
                 from curl_cffi import requests as curl_requests
@@ -134,6 +175,11 @@ class Sub2APIClient:
             session = curl_requests.Session()
         self._session = session
         self._access_token = ""
+
+    @property
+    def _use_session_auth(self) -> bool:
+        has_totp_session = bool(self.email and self.password and self.totp_secret)
+        return has_totp_session or not self.api_key
 
     @property
     def api_base_url(self) -> str:
@@ -171,11 +217,18 @@ class Sub2APIClient:
         json_data: Mapping[str, Any] | None = None,
         authenticated: bool = True,
     ) -> Any:
-        if authenticated and not self._access_token:
+        if authenticated and self._use_session_auth and not self._access_token:
             self.login()
         headers = {"Accept": "application/json"}
+        if path == "/admin" or path.startswith("/admin/"):
+            headers["X-Admin-UI-Request"] = "1"
+        if path == "/user" or path.startswith("/user/"):
+            headers["X-User-UI-Request"] = "1"
         if authenticated:
-            headers["Authorization"] = f"Bearer {self._access_token}"
+            if self._use_session_auth:
+                headers["Authorization"] = f"Bearer {self._access_token}"
+            else:
+                headers["x-api-key"] = self.api_key
         response = self._session.request(
             method,
             f"{self.api_base_url}{path}",
@@ -193,7 +246,12 @@ class Sub2APIClient:
             ) from exc
         if not 200 <= response.status_code < 300:
             detail = payload.get("message") if isinstance(payload, dict) else None
-            raise Sub2APIError(f"Sub2API HTTP {response.status_code}: {detail or response.reason}")
+            code = payload.get("code") if isinstance(payload, dict) else None
+            code_label = f" [{code}]" if code else ""
+            raise Sub2APIError(
+                f"Sub2API HTTP {response.status_code} on {method.upper()} {path}"
+                f"{code_label}: {detail or response.reason}"
+            )
         return self._unwrap(payload)
 
     def login(self) -> None:
@@ -203,6 +261,24 @@ class Sub2APIClient:
             json_data={"email": self.email, "password": self.password},
             authenticated=False,
         )
+        if isinstance(data, dict) and data.get("requires_2fa") is True:
+            if not self.totp_secret:
+                raise Sub2APIError(
+                    "Sub2API login requires TOTP; configure the administrator TOTP secret"
+                )
+            temp_token = str(data.get("temp_token") or "").strip()
+            if not temp_token:
+                raise Sub2APIError("Sub2API 2FA login did not return a temporary token")
+            try:
+                totp_code = _totp_code(self.totp_secret)
+            except ValueError as exc:
+                raise Sub2APIError("Sub2API TOTP secret is invalid") from exc
+            data = self._request(
+                "POST",
+                "/auth/login/2fa",
+                json_data={"temp_token": temp_token, "totp_code": totp_code},
+                authenticated=False,
+            )
         token = str((data or {}).get("access_token") if isinstance(data, dict) else "").strip()
         if not token:
             raise Sub2APIError("Sub2API login did not return an access token")
@@ -212,6 +288,21 @@ class Sub2APIClient:
         data = self._request("GET", "/admin/accounts/data?include_proxies=false")
         accounts = data.get("accounts") if isinstance(data, dict) else None
         return [dict(item) for item in (accounts or []) if isinstance(item, dict)]
+
+    def verify_step_up(self) -> None:
+        if not self._use_session_auth or not self.totp_secret:
+            raise Sub2APIError(
+                "Sub2API protected operations require a TOTP-verified administrator session"
+            )
+        try:
+            code = _totp_code(self.totp_secret)
+        except ValueError as exc:
+            raise Sub2APIError("Sub2API TOTP secret is invalid") from exc
+        self._request(
+            "POST",
+            "/user/totp/step-up",
+            json_data={"code": code},
+        )
 
     def list_groups(
         self,
@@ -324,6 +415,8 @@ class Sub2APIClient:
     ) -> Sub2APIPushResult:
         account = dict(account)
         account_name = str(account.get("name") or "ChatGPT Account")
+        if self.totp_secret:
+            self.verify_step_up()
         remote_accounts = self.export_accounts()
         matching_remote = next(
             (remote for remote in remote_accounts if self._same_token(remote, account)),

@@ -66,25 +66,46 @@ class CpaTests(unittest.TestCase):
                 "id_token_synthetic",
                 "access_token",
                 "refresh_token",
-                "session_token",
                 "last_refresh",
-                "expired",
-                "headers",
             ],
         )
         self.assertEqual(result["account_id"], self.account_id)
         self.assertEqual(result["chatgpt_account_id"], self.account_id)
         self.assertEqual(result["email"], self.email)
         self.assertEqual(result["plan_type"], "team")
+        self.assertEqual(result["access_token"], "at-personal")
         self.assertEqual(result["refresh_token"], "")
-        self.assertEqual(result["session_token"], "session-token")
         self.assertEqual(result["last_refresh"], "2026-07-12T06:42:32.699Z")
-        self.assertEqual(result["headers"], {"authorization": "Bearer at-personal"})
         self.assertTrue(result["id_token_synthetic"])
+        self.assertNotIn("session_token", result)
+        self.assertNotIn("expired", result)
+        self.assertNotIn("headers", result)
 
         id_payload = decode_jwt_payload(result["id_token"])
         self.assertEqual(id_payload["iat"], int(now.timestamp()))
         self.assertEqual(id_payload["exp"], self.exp)
+        self.assertEqual(id_payload["email"], self.email)
+        self.assertEqual(id_payload[OPENAI_AUTH_CLAIM]["chatgpt_account_id"], self.account_id)
+
+    def test_build_cpa_does_not_require_session_tokens(self):
+        now = datetime(2026, 7, 16, 8, 30, 21, 350000, tzinfo=timezone.utc)
+        result = build_cpa(
+            {
+                "user": {"id": self.user_id, "email": self.email},
+                "account": {"id": self.account_id, "planType": "team"},
+            },
+            personal_access_token="Bearer at-personal",
+            now=now,
+        )
+
+        self.assertEqual(result["access_token"], "at-personal")
+        self.assertEqual(result["refresh_token"], "")
+        self.assertEqual(result["last_refresh"], "2026-07-16T08:30:21.350Z")
+        self.assertTrue(result["id_token_synthetic"])
+        self.assertNotIn("session_token", result)
+        self.assertNotIn("expired", result)
+        self.assertNotIn("headers", result)
+        id_payload = decode_jwt_payload(result["id_token"])
         self.assertEqual(id_payload["email"], self.email)
         self.assertEqual(id_payload[OPENAI_AUTH_CLAIM]["chatgpt_account_id"], self.account_id)
 
